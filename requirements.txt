@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sse-starlette
+pydantic
+
+# W1 후반 (DB·인증 붙일 때)
+sqlalchemy
+bcrypt
+python-jose[cryptography]
+python-dotenv
