@@ -76,7 +76,7 @@ def create_notice(payload: dict, operator_id: int) -> dict:
         "direction": payload.get("direction"),
         "expires_at": expires_at,
         "revision": 0,
-        "trigger_haptic": payload["intent_type"] in ("FIRE", "POWER_OUT"),
+        "trigger_haptic": payload["intent_type"] == "FIRE",
         "created_by": operator_id,
         "created_at": now(),
         "updated_at": None,
