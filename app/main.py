@@ -9,11 +9,14 @@ W1 후반에 저장소만 SQLAlchemy 로 바꾸면 프론트는 수정 불필요
 문서:
     http://localhost:8000/docs
 """
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app import hub, store
-from app.routers import auth, notices, stream
+from app.routers import auth, notices, operator, stream
 
 app = FastAPI(
     title="세이프큐 백엔드 (더미)",
@@ -63,3 +66,9 @@ def intents():
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(notices.router, prefix="/api", tags=["notices"])
 app.include_router(stream.router, prefix="/api", tags=["stream"])
+app.include_router(operator.router, prefix="/api", tags=["operator"])
+
+# 개발용 마이크 테스트 페이지: http://localhost:8000/static/mic_test.html
+_static = Path(__file__).resolve().parents[1] / "static"
+if _static.is_dir():
+    app.mount("/static", StaticFiles(directory=_static), name="static")

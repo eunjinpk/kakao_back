@@ -1,0 +1,2277 @@
+diff --git a/.env.example b/.env.example
+index 39b0a70..1474f2c 100644
+--- a/.env.example
++++ b/.env.example
+@@ -4,6 +4,25 @@ PORT=8000
+ DATABASE_URL=sqlite:///./safeq.db
+ JWT_SECRET=change-me-in-local-env
+ 
+-# W2~ 음성 트랙 (개발자 B)
+-STT_API_KEY=
+-LLM_API_KEY=
++# ── 음성 트랙 (개발자 B) ─────────────────────────────────────────
++# clova = CLOVA Speech 실시간 스트리밍 / mock = 키 없이 개발 (샘플 문장 출력)
++STT_PROVIDER=mock
++CLOVA_SECRET_KEY=
++CLOVA_HOST=clovaspeech-gw.ncloud.com:50051
++CLOVA_LANGUAGE=ko
++CLOVA_GAP_THRESHOLD_MS=600
++CLOVA_DURATION_THRESHOLD_MS=6000
++STT_IDLE_TIMEOUT_SEC=30
++
++# openai = GPT-4o-mini / mock = 키워드 규칙
++LLM_PROVIDER=mock
++OPENAI_API_KEY=
++LLM_MODEL=gpt-4o-mini
++LLM_TIMEOUT_SEC=5
++
++# 텍스트 버퍼(초) · 같은 intent 재추천 금지 시간(초)
++BUFFER_WINDOW_SEC=10
++SUGGEST_COOLDOWN_SEC=30
++
++# 공연 녹음 금지: 로컬 디버깅 때만 true (tmp/recordings/*.wav)
++DEBUG_SAVE_AUDIO=false
+diff --git a/README.md b/README.md
+index 07c2289..6a8d85b 100644
+--- a/README.md
++++ b/README.md
+@@ -61,20 +61,26 @@ es.addEventListener('heartbeat', () => { /* 연결 살아있음 */ });
+ 보내고, 서버가 그 뒤 이벤트를 전부 다시 보냅니다. 거기에 더해, 탭이 다시 활성화되거나
+ 네트워크가 복구될 때 `GET /api/notices/active` 를 한 번 호출해 화면을 맞추면 확실합니다.
+ 
+-### 3. 오퍼레이터 화면 — WebSocket (추천 받기 + 오디오 올리기)
++### 3. 오퍼레이터 화면 — WebSocket (오디오 올리기 + 자막·추천 받기)
+ 
+ ```js
++// 인증 없음 (11/10 회의: 로그인 제외)
+ const ws = new WebSocket('ws://localhost:8000/api/ws/operator');
++ws.binaryType = 'arraybuffer';
+ ws.onmessage = (e) => {
+   const msg = JSON.parse(e.data);
+-  if (msg.event === 'suggestion') {
+-    // msg.data.intent_type, msg.data.templates[]  → 추천 팝업
+-    // 오퍼레이터가 하나 골라 POST /api/notices 호출
++  switch (msg.type) {
++    case 'connected':  /* 오디오 전송 시작 */ break;
++    case 'transcript': /* msg.text, msg.is_final → 실시간 자막 */ break;
++    case 'suggestion': /* msg.intent_type, msg.templates[] → 추천 팝업, 하나 골라 POST /api/notices */ break;
++    case 'error':      /* msg.code, msg.message */ break;
+   }
+ };
++// 오디오: 16kHz mono PCM16 바이너리 (static/pcm-worklet.js 사용)
+ ```
+ 
+-더미 서버는 **15초마다 가짜 추천**을 보냅니다. 추천 팝업 UI 를 만들어 보세요.
++자세한 이벤트 명세: **[docs/WS_OPERATOR.md](docs/WS_OPERATOR.md)** · 마이크 테스트: `http://localhost:8000/static/mic_test.html`
++`.env` 의 `STT_PROVIDER=mock` 이면 키 없이도 샘플 자막과 추천이 옵니다.
+ 
+ ---
+ 
+@@ -89,7 +95,7 @@ ws.onmessage = (e) => {
+ | POST | `/api/notices` | 공지 승인·송출 |
+ | PATCH | `/api/notices/{id}` | 정정 |
+ | POST | `/api/notices/{id}/end` | 종료 |
+-| WS | `/api/ws/operator` | 오디오 업로드 + 추천 수신 |
++| WS | `/api/ws/operator` | 오디오 업로드 + 자막·추천 수신 ([명세](docs/WS_OPERATOR.md)) |
+ 
+ ### 관객 (인증 없음)
+ 
+@@ -193,8 +199,10 @@ app/
+ └── routers/
+     ├── auth.py          로그인 (W1 후반 bcrypt + JWT 로 교체)
+     ├── notices.py       송출 / 정정 / 종료 / 조회
+-    └── stream.py        SSE + WebSocket
++    ├── stream.py        관객 SSE
++    └── operator.py      오퍼레이터 WebSocket (개발자 B)
+ 
++app/ai/                  AI 파이프라인 (개발자 B) → docs/AI_PIPELINE.md
+ data/templates.json      템플릿 문구 (개발자 B 관리)
+ ```
+ 
+diff --git a/app/ai/__init__.py b/app/ai/__init__.py
+new file mode 100644
+index 0000000..7921d3c
+--- /dev/null
++++ b/app/ai/__init__.py
+@@ -0,0 +1,6 @@
++"""
++개발자 B — AI 파이프라인
++
++현장 음성(PCM16) → CLOVA Speech 스트리밍 STT → 텍스트 버퍼 → GPT-4o-mini 의도 분류
++→ 오퍼레이터에게 추천(suggestion). 관객에게는 절대 직접 보내지 않는다.
++"""
+diff --git a/app/ai/buffer.py b/app/ai/buffer.py
+new file mode 100644
+index 0000000..9c55d65
+--- /dev/null
++++ b/app/ai/buffer.py
+@@ -0,0 +1,39 @@
++"""
++텍스트 버퍼 — STT 확정 문장을 최근 N초 분량만 들고 있는다.
++
++현장 음성은 한 안내 방송이 여러 조각으로 나뉘어 들어온다.
++("화재가 발생했..." / "...비상구로 대피해 주십시오")
++그래서 마지막 조각 하나가 아니라 최근 몇 초를 묶어서 LLM 에 넘긴다.
++"""
++import time
++from collections import deque
++from typing import Callable
++
++
++class TextBuffer:
++    def __init__(self, window_sec: float = 10, clock: Callable[[], float] = time.monotonic):
++        self.window_sec = window_sec
++        self._clock = clock
++        self._items: deque[tuple[float, str]] = deque()
++
++    def add(self, text: str) -> None:
++        text = text.strip()
++        if text:
++            self._items.append((self._clock(), text))
++        self._evict()
++
++    def text(self) -> str:
++        self._evict()
++        return " ".join(t for _, t in self._items)
++
++    def clear(self) -> None:
++        self._items.clear()
++
++    def __len__(self) -> int:
++        self._evict()
++        return len(self._items)
++
++    def _evict(self) -> None:
++        cutoff = self._clock() - self.window_sec
++        while self._items and self._items[0][0] < cutoff:
++            self._items.popleft()
+diff --git a/app/ai/classifier.py b/app/ai/classifier.py
+new file mode 100644
+index 0000000..38bf4d9
+--- /dev/null
++++ b/app/ai/classifier.py
+@@ -0,0 +1,133 @@
++"""
++의도 분류기 — STT 텍스트를 intent 하나로 바꾼다.
++
++- 실제: GPT-4o-mini (JSON 출력, temperature 0)
++- 개발용: 키워드 규칙 (키 없이 프론트/파이프라인을 붙여볼 때)
++
++어떤 경우든 결과는 LLM_INTENTS 중 하나다. 이상한 값, 파싱 실패, 타임아웃은 전부 NONE.
++→ "확실하지 않으면 NONE" 이 오경보를 막는 마지막 장치.
++"""
++import json
++import logging
++import re
++from typing import Protocol
++
++from app.ai import config
++from app.ai.intents import DEFINITIONS, LLM_INTENTS, PRIORITY
++
++log = logging.getLogger("safeq.ai.classifier")
++
++
++# ── 프롬프트 v1 ──────────────────────────────────────────────────────
++def build_system_prompt() -> str:
++    defs = "\n".join(f"- {k}: {v}" for k, v in DEFINITIONS.items())
++    order = " > ".join(PRIORITY)
++    return f"""너는 공연장 안내 방송 분류기다.
++입력은 소음과 잔향이 심한 공연장에서 받은 음성 인식(STT) 결과라서 글자가 틀리거나 문장이 끊겨 있을 수 있다.
++입력이 어떤 안내 방송인지 아래 분류 중 정확히 하나를 골라라.
++
++[분류]
++{defs}
++
++[규칙]
++1. 확실하지 않으면 NONE 을 고른다. 억지로 다른 분류를 고르지 않는다.
++2. 안내 방송(스태프가 관객에게 하는 공지) 형태의 발화만 분류한다.
++   공연 대사, 노래 가사, 관객끼리의 대화는 내용이 비슷해도 NONE 이다.
++   예: 배우가 외치는 "불이야! 도망쳐!" 는 NONE.
++3. 한 발화가 여러 분류에 걸치면 우선순위가 높은 쪽을 고른다: {order}
++   예: "정전으로 공연을 잠시 중단합니다" 는 POWER_OUT.
++4. 글자가 깨져 있어도 안내 의도가 분명하면 분류한다.
++   예: "화재가 발생했... 비상구로 대파..." 는 FIRE.
++
++[출력]
++JSON 하나만 출력한다. 다른 글자는 쓰지 않는다.
++{{"intent": "<분류 이름>"}}"""
++
++
++def parse_intent(raw: str | None) -> str:
++    """LLM 응답 문자열 → intent. 규격에 안 맞으면 전부 NONE."""
++    if not raw:
++        return "NONE"
++    try:
++        data = json.loads(raw)
++    except (json.JSONDecodeError, TypeError):
++        # 앞뒤에 잡문이 붙은 경우 첫 번째 {...} 만 다시 시도
++        m = re.search(r"\{.*?\}", raw, re.S)
++        if not m:
++            return "NONE"
++        try:
++            data = json.loads(m.group(0))
++        except json.JSONDecodeError:
++            return "NONE"
++    if not isinstance(data, dict):
++        return "NONE"
++    intent = str(data.get("intent", "")).strip().upper()
++    return intent if intent in LLM_INTENTS else "NONE"
++
++
++class Classifier(Protocol):
++    async def classify(self, text: str) -> str: ...
++
++
++# ── GPT-4o-mini ──────────────────────────────────────────────────────
++class OpenAIClassifier:
++    def __init__(self, api_key: str | None = None, model: str | None = None,
++                 timeout: float | None = None, client=None):
++        if client is None:
++            from openai import AsyncOpenAI
++
++            client = AsyncOpenAI(api_key=api_key or config.OPENAI_API_KEY)
++        self.client = client
++        self.model = model or config.LLM_MODEL
++        self.timeout = timeout or config.LLM_TIMEOUT_SEC
++        self.system_prompt = build_system_prompt()
++
++    async def classify(self, text: str) -> str:
++        if not text.strip():
++            return "NONE"
++        try:
++            resp = await self.client.chat.completions.create(
++                model=self.model,
++                temperature=0,
++                max_tokens=20,
++                response_format={"type": "json_object"},
++                messages=[
++                    {"role": "system", "content": self.system_prompt},
++                    {"role": "user", "content": text},
++                ],
++                timeout=self.timeout,
++            )
++            raw = resp.choices[0].message.content
++        except Exception as e:  # 네트워크, 타임아웃, 요금 한도 등 → 추천 안 함
++            log.warning("LLM 호출 실패 → NONE 처리: %s", e)
++            return "NONE"
++        return parse_intent(raw)
++
++
++# ── 개발용 키워드 분류기 ─────────────────────────────────────────────
++_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
++    ("FIRE", ("화재", "불이 났", "대피", "비상구", "지진")),
++    ("POWER_OUT", ("정전", "전기", "설비", "음향 장비")),
++    ("PAUSE", ("중단", "멈추", "중지")),
++    ("DELAY", ("지연", "늦어", "시작이 늦")),
++    ("INTERMISSION", ("인터미션", "휴식", "쉬는 시간")),
++    ("ETIQUETTE", ("촬영", "녹음", "취식", "음식", "휴대폰", "휴대전화")),
++]
++
++
++class KeywordClassifier:
++    """LLM 키 없이 파이프라인을 돌려볼 때만 쓴다. 정확도 평가 대상 아님."""
++
++    async def classify(self, text: str) -> str:
++        for intent in PRIORITY:  # 우선순위 순서로 검사
++            words = dict(_KEYWORDS)[intent]
++            if any(w in text for w in words):
++                return intent
++        return "NONE"
++
++
++def make_classifier(provider: str | None = None) -> Classifier:
++    provider = (provider or config.LLM_PROVIDER).lower()
++    if provider == "openai":
++        return OpenAIClassifier()
++    return KeywordClassifier()
+diff --git a/app/ai/config.py b/app/ai/config.py
+new file mode 100644
+index 0000000..17ed760
+--- /dev/null
++++ b/app/ai/config.py
+@@ -0,0 +1,63 @@
++"""
++AI 파이프라인 설정. 전부 .env 로 바꿀 수 있다 (.env.example 참고).
++"""
++import os
++
++try:
++    from dotenv import load_dotenv
++
++    load_dotenv()
++except ImportError:  # python-dotenv 가 없어도 동작
++    pass
++
++
++def _bool(name: str, default: bool) -> bool:
++    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
++
++
++def _int(name: str, default: int) -> int:
++    try:
++        return int(os.getenv(name, default))
++    except (TypeError, ValueError):
++        return default
++
++
++# ── STT ──────────────────────────────────────────────────────────────
++# clova: CLOVA Speech 실시간 스트리밍 (gRPC)
++# mock : 키 없이 개발할 때. 오디오가 일정량 들어오면 샘플 문장을 transcript 로 낸다
++STT_PROVIDER = os.getenv("STT_PROVIDER", "mock").strip().lower()
++
++CLOVA_SECRET_KEY = os.getenv("CLOVA_SECRET_KEY", "")
++CLOVA_HOST = os.getenv("CLOVA_HOST", "clovaspeech-gw.ncloud.com:50051")
++CLOVA_LANGUAGE = os.getenv("CLOVA_LANGUAGE", "ko")
++# 문장 끊기 기준 (ms). 짧을수록 transcript 가 자주, 빨리 온다
++CLOVA_GAP_THRESHOLD_MS = _int("CLOVA_GAP_THRESHOLD_MS", 600)
++CLOVA_DURATION_THRESHOLD_MS = _int("CLOVA_DURATION_THRESHOLD_MS", 6000)
++
++# 오디오가 이 시간(초) 동안 안 들어오면 CLOVA 연결을 닫는다 (권장사항: 유휴 커넥션 정리)
++STT_IDLE_TIMEOUT_SEC = _int("STT_IDLE_TIMEOUT_SEC", 30)
++
++# mock STT: 몇 초 분량의 오디오마다 문장 하나를 낼지
++MOCK_STT_EVERY_SEC = float(os.getenv("MOCK_STT_EVERY_SEC", "3"))
++
++# ── 오디오 형식 (피드백 #2: 16kHz mono PCM16) ──────────────────────────
++SAMPLE_RATE = 16000
++CHANNELS = 1
++BYTES_PER_SAMPLE = 2
++BYTES_PER_SEC = SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE  # 32,000
++
++# 공연 녹음 금지 원칙: 기본값 False. 로컬 디버깅 때만 켠다 (tmp/recordings/*.wav)
++DEBUG_SAVE_AUDIO = _bool("DEBUG_SAVE_AUDIO", False)
++
++# ── LLM ──────────────────────────────────────────────────────────────
++# openai: GPT-4o-mini
++# mock  : 키 없이 개발할 때. 키워드 규칙으로 분류
++LLM_PROVIDER = os.getenv("LLM_PROVIDER", "mock").strip().lower()
++OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "") or os.getenv("LLM_API_KEY", "")
++LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
++LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "5"))
++
++# ── 버퍼 / 추천 ──────────────────────────────────────────────────────
++BUFFER_WINDOW_SEC = _int("BUFFER_WINDOW_SEC", 10)
++# 같은 intent 추천을 이 시간(초) 동안 다시 보내지 않는다 (팝업 도배 방지)
++SUGGEST_COOLDOWN_SEC = _int("SUGGEST_COOLDOWN_SEC", 30)
+diff --git a/app/ai/intents.py b/app/ai/intents.py
+new file mode 100644
+index 0000000..c1dc13a
+--- /dev/null
++++ b/app/ai/intents.py
+@@ -0,0 +1,26 @@
++"""
++intent 정의 — LLM 프롬프트와 평가 스크립트가 함께 쓴다.
++
++목록 자체는 app/store.py 의 LLM_INTENTS / TEMPLATE_INTENTS 와 같아야 한다.
++(어느 한쪽에서 import 하도록 A 와 합의 예정. 지금은 테스트로 일치 여부를 확인한다.)
++"""
++
++LLM_INTENTS = ("FIRE", "POWER_OUT", "PAUSE", "DELAY", "INTERMISSION", "ETIQUETTE", "NONE")
++TEMPLATE_INTENTS = ("FIRE", "POWER_OUT", "PAUSE", "DELAY", "INTERMISSION", "ETIQUETTE", "INFO")
++
++# 한 발화가 여러 상황에 걸치면 앞쪽(더 긴급한 쪽)으로 분류한다
++PRIORITY = ["FIRE", "POWER_OUT", "PAUSE", "DELAY", "INTERMISSION", "ETIQUETTE"]
++
++# AI 추천으로 이어지는 intent = 두 목록의 교집합 (NONE 은 템플릿 없음, INFO 는 LLM 이 안 뱉음)
++SUGGESTABLE = tuple(i for i in LLM_INTENTS if i in TEMPLATE_INTENTS)
++
++# 프롬프트에 그대로 들어가는 설명
++DEFINITIONS = {
++    "FIRE": "화재, 지진 등 관객 대피가 필요한 비상 상황 안내",
++    "POWER_OUT": "정전, 음향·조명 등 설비 이상 안내",
++    "PAUSE": "공연 도중 공연을 일시 중단한다는 안내",
++    "DELAY": "공연 시작 전, 시작이 지연된다는 안내",
++    "INTERMISSION": "인터미션(중간 휴식) 시작 또는 종료 안내",
++    "ETIQUETTE": "촬영·녹음·취식·휴대폰 사용 금지 등 관람 예절 안내",
++    "NONE": "위에 해당하지 않음. 공연 대사, 노래 가사, 관객 잡담, 의미를 알 수 없는 소음, 확실하지 않은 경우",
++}
+diff --git a/app/ai/pipeline.py b/app/ai/pipeline.py
+new file mode 100644
+index 0000000..3ce2539
+--- /dev/null
++++ b/app/ai/pipeline.py
+@@ -0,0 +1,136 @@
++"""
++오퍼레이터 세션 하나의 AI 파이프라인.
++
++  PCM 오디오 ─▶ STT ─▶ transcript 이벤트 (오퍼레이터 화면 실시간 자막)
++                   └▶ (확정 문장) 텍스트 버퍼(최근 N초) ─▶ LLM 분류
++                        └▶ intent 가 추천 대상이면 suggestion 이벤트 (해당 intent 템플릿 전부)
++
++관객에게는 아무것도 보내지 않는다. 송출은 오퍼레이터가 템플릿을 골라
++POST /api/notices 를 호출할 때만 일어난다 (개발자 A 영역).
++"""
++import asyncio
++import logging
++import time
++import wave
++from pathlib import Path
++from typing import Any, Awaitable, Callable
++
++from app.ai import config
++from app.ai.buffer import TextBuffer
++from app.ai.classifier import Classifier, make_classifier
++from app.ai.intents import SUGGESTABLE
++from app.ai.stt import STTSession, make_stt_session
++
++log = logging.getLogger("safeq.ai.pipeline")
++
++Send = Callable[[dict], Awaitable[None]]
++TemplateLookup = Callable[[str], list[dict]]
++
++
++def _default_template_lookup(intent: str) -> list[dict]:
++    from app import store  # 개발자 A 의 저장소 (DB 로 바뀌어도 함수 이름은 유지 합의)
++
++    return store.templates_for_intent(intent)
++
++
++class OperatorPipeline:
++    def __init__(
++        self,
++        send: Send,
++        session_id: str,
++        stt: STTSession | None = None,
++        classifier: Classifier | None = None,
++        template_lookup: TemplateLookup | None = None,
++        clock: Callable[[], float] = time.monotonic,
++    ):
++        self.send = send
++        self.session_id = session_id
++        self.stt = stt or make_stt_session(self._on_transcript)
++        if stt is not None:
++            stt.on_transcript = self._on_transcript  # 주입된 STT 도 콜백 연결
++        self.classifier = classifier or make_classifier()
++        self.template_lookup = template_lookup or _default_template_lookup
++        self.buffer = TextBuffer(config.BUFFER_WINDOW_SEC, clock=clock)
++        self._clock = clock
++        self._last_suggested: dict[str, float] = {}
++        self._classify_lock = asyncio.Lock()
++        self._tasks: set[asyncio.Task] = set()
++        self._wav: wave.Wave_write | None = None
++
++    # ── 생명주기 ────────────────────────────────────────────────────
++    async def start(self) -> None:
++        if config.DEBUG_SAVE_AUDIO:
++            path = Path("tmp/recordings") / f"{self.session_id}.wav"
++            path.parent.mkdir(parents=True, exist_ok=True)
++            self._wav = wave.open(str(path), "wb")
++            self._wav.setnchannels(config.CHANNELS)
++            self._wav.setsampwidth(config.BYTES_PER_SAMPLE)
++            self._wav.setframerate(config.SAMPLE_RATE)
++            log.warning("DEBUG_SAVE_AUDIO=on → %s 에 저장 중 (공연 중에는 끄세요)", path)
++        await self.stt.start()
++
++    async def feed_audio(self, pcm: bytes) -> None:
++        if self._wav:
++            self._wav.writeframes(pcm)
++        await self.stt.feed(pcm)
++
++    async def close(self) -> None:
++        try:
++            await self.stt.close()
++        finally:
++            for t in list(self._tasks):
++                t.cancel()
++            if self._wav:
++                self._wav.close()
++                self._wav = None
++
++    # ── STT 결과 처리 ───────────────────────────────────────────────
++    async def _on_transcript(self, text: str, is_final: bool) -> None:
++        await self.send({"type": "transcript", "text": text, "is_final": is_final, "ts": _now_iso()})
++        if not is_final:
++            return
++        self.buffer.add(text)
++        # 분류는 오래 걸릴 수 있으니 STT 수신을 막지 않도록 태스크로 돌린다
++        task = asyncio.create_task(self._classify_and_suggest())
++        self._tasks.add(task)
++        task.add_done_callback(self._tasks.discard)
++
++    async def _classify_and_suggest(self) -> dict | None:
++        async with self._classify_lock:  # 순서 보장: 앞 문장 분류가 끝난 뒤 다음 분류
++            window = self.buffer.text()
++            if not window:
++                return None
++            intent = await self.classifier.classify(window)
++            log.info("분류: %s ← %r", intent, window)
++            if intent not in SUGGESTABLE:
++                return None
++            now = self._clock()
++            last = self._last_suggested.get(intent)
++            if last is not None and now - last < config.SUGGEST_COOLDOWN_SEC:
++                return None  # 같은 상황 추천 반복 방지
++            templates = self.template_lookup(intent)
++            if not templates:
++                log.warning("intent %s 에 템플릿이 없습니다 (templates.json 확인)", intent)
++                return None
++            self._last_suggested[intent] = now
++            payload: dict[str, Any] = {
++                "type": "suggestion",
++                "intent_type": intent,
++                "stt_text": window,
++                "templates": templates,
++                "ts": _now_iso(),
++            }
++            self.buffer.clear()  # 같은 문장으로 다시 추천하지 않도록
++            await self.send(payload)
++            return payload
++
++    async def drain(self) -> None:
++        """테스트용: 진행 중인 분류가 모두 끝날 때까지 기다린다."""
++        while self._tasks:
++            await asyncio.gather(*list(self._tasks), return_exceptions=True)
++
++
++def _now_iso() -> str:
++    from datetime import datetime, timezone
++
++    return datetime.now(timezone.utc).isoformat()
+diff --git a/app/ai/stt/__init__.py b/app/ai/stt/__init__.py
+new file mode 100644
+index 0000000..8d5f411
+--- /dev/null
++++ b/app/ai/stt/__init__.py
+@@ -0,0 +1,35 @@
++"""
++STT (음성 → 텍스트)
++
++업체를 바꿔 끼울 수 있게 세션 인터페이스 하나로 감싼다.
++    session = make_stt_session(on_transcript)
++    await session.start()
++    await session.feed(pcm_bytes)   # 16kHz mono PCM16
++    await session.close()
++
++on_transcript(text: str, is_final: bool) 는 결과가 나올 때마다 호출된다.
++"""
++from typing import Awaitable, Callable, Protocol
++
++from app.ai import config
++
++OnTranscript = Callable[[str, bool], Awaitable[None]]
++
++
++class STTSession(Protocol):
++    provider: str
++
++    async def start(self) -> None: ...
++    async def feed(self, pcm: bytes) -> None: ...
++    async def close(self) -> None: ...
++
++
++def make_stt_session(on_transcript: OnTranscript, provider: str | None = None) -> STTSession:
++    provider = (provider or config.STT_PROVIDER).lower()
++    if provider == "clova":
++        from app.ai.stt.clova import ClovaStreamSession
++
++        return ClovaStreamSession(on_transcript)
++    from app.ai.stt.mock import MockSTTSession
++
++    return MockSTTSession(on_transcript)
+diff --git a/app/ai/stt/clova.py b/app/ai/stt/clova.py
+new file mode 100644
+index 0000000..c9eb896
+--- /dev/null
++++ b/app/ai/stt/clova.py
+@@ -0,0 +1,193 @@
++"""
++CLOVA Speech 실시간 스트리밍 (gRPC)
++
++공식 문서: https://api.ncloud-docs.com/docs/ai-application-service-clovaspeech-grpc
++
++흐름
++  1. 오퍼레이터 WebSocket 하나당 gRPC 양방향 스트림 하나 (요금: 요청 단위 15초 올림 → 청크마다 요청 금지)
++  2. 첫 메시지는 CONFIG(JSON), 이후 DATA(PCM 청크)
++  3. 응답은 JSON 문자열. responseType 이 transcription 인 것만 텍스트로 쓴다
++  4. 오디오가 STT_IDLE_TIMEOUT_SEC 동안 안 오면 스트림을 닫고, 다시 오면 새로 연다
++
++오디오: 헤더 없는 PCM, 16kHz, mono, 16bit (프론트가 그대로 보냄 → 변환 없음)
++"""
++import asyncio
++import json
++import logging
++import time
++
++import grpc
++
++from app.ai import config
++from app.ai.stt import OnTranscript
++
++log = logging.getLogger("safeq.ai.stt.clova")
++
++_CLOSE = object()  # 요청 큐 종료 신호
++
++
++def build_config() -> dict:
++    return {
++        "transcription": {"language": config.CLOVA_LANGUAGE},
++        # 문장 끊기: 무음(gap) 또는 최대 길이(duration) 기준으로 결과를 자주 받는다
++        "semanticEpd": {
++            "skipEmptyText": True,
++            "usePeriodEpd": True,
++            "gapThreshold": config.CLOVA_GAP_THRESHOLD_MS,
++            "durationThreshold": config.CLOVA_DURATION_THRESHOLD_MS,
++        },
++    }
++
++
++def parse_response(contents: str) -> tuple[str, bool] | None:
++    """
++    CLOVA 응답 JSON → (text, is_final). 텍스트가 없으면 None.
++
++    CLOVA 스트리밍은 EPD(문장 끝 감지)가 일어날 때 그 구간 결과를 한 번에 준다.
++    → 받은 결과는 모두 확정(is_final=True)으로 본다.
++    """
++    try:
++        data = json.loads(contents)
++    except (json.JSONDecodeError, TypeError):
++        return None
++    if data.get("responseType") not in ("transcription", ["transcription"]):
++        # config 응답, recognize 상태 응답 등
++        if data.get("recognize", {}).get("status") not in (None, "Success", "success"):
++            log.warning("CLOVA 상태 응답: %s", data.get("recognize"))
++        return None
++    text = (data.get("transcription") or {}).get("text", "").strip()
++    if not text:
++        return None
++    return text, True
++
++
++class ClovaStreamSession:
++    provider = "clova"
++
++    def __init__(self, on_transcript: OnTranscript, secret_key: str | None = None,
++                 host: str | None = None, idle_timeout: float | None = None,
++                 secure: bool = True):
++        self.on_transcript = on_transcript
++        self.secret_key = secret_key or config.CLOVA_SECRET_KEY
++        self.host = host or config.CLOVA_HOST
++        self.idle_timeout = idle_timeout or config.STT_IDLE_TIMEOUT_SEC
++        self.secure = secure  # 테스트용 로컬 가짜 서버에서만 False
++
++        self._channel: grpc.aio.Channel | None = None
++        self._queue: asyncio.Queue | None = None
++        self._reader: asyncio.Task | None = None
++        self._watchdog: asyncio.Task | None = None
++        self._last_audio = 0.0
++        self._seq = 0
++        self._lock = asyncio.Lock()
++
++    # ── 공개 메서드 ──────────────────────────────────────────────────
++    async def start(self) -> None:
++        if not self.secret_key:
++            raise RuntimeError("CLOVA_SECRET_KEY 가 비어 있습니다 (.env 확인)")
++        # 실제 연결은 첫 오디오가 들어올 때 연다 (유휴 연결 방지)
++
++    async def feed(self, pcm: bytes) -> None:
++        if not pcm:
++            return
++        async with self._lock:
++            err = self.stream_error
++            if err is not None:  # 직전 스트림이 오류로 끊김 → 정리 후 알림 (다음 오디오에서 재연결)
++                await self._shutdown()
++                raise RuntimeError(f"CLOVA 스트림 오류: {err}")
++            if self._queue is None:
++                await self._open()
++        self._last_audio = time.monotonic()
++        self._seq += 1
++        await self._queue.put(pcm)
++
++    async def close(self) -> None:
++        async with self._lock:
++            await self._shutdown()
++
++    # ── 내부 ────────────────────────────────────────────────────────
++    async def _open(self) -> None:
++        from app.ai.stt.proto import nest_pb2, nest_pb2_grpc
++
++        self._pb2 = nest_pb2
++        if self.secure:
++            self._channel = grpc.aio.secure_channel(self.host, grpc.ssl_channel_credentials())
++        else:
++            self._channel = grpc.aio.insecure_channel(self.host)
++        stub = nest_pb2_grpc.NestServiceStub(self._channel)
++        self._queue = asyncio.Queue()
++        self._seq = 0
++        # Python 은 메타데이터 키가 소문자여야 한다 (공식 문서)
++        call = stub.recognize(self._requests(), metadata=(("authorization", f"Bearer {self.secret_key}"),))
++        self._reader = asyncio.create_task(self._read(call))
++        self._last_audio = time.monotonic()
++        self._watchdog = asyncio.create_task(self._idle_watch())
++        log.info("CLOVA 스트림 열림")
++
++    async def _requests(self):
++        pb2 = self._pb2
++        yield pb2.NestRequest(
++            type=pb2.RequestType.CONFIG,
++            config=pb2.NestConfig(config=json.dumps(build_config())),
++        )
++        queue = self._queue
++        while True:
++            item = await queue.get()
++            if item is _CLOSE:
++                # 마지막 신호: epFlag=true 로 남은 결과를 즉시 받는다
++                yield pb2.NestRequest(
++                    type=pb2.RequestType.DATA,
++                    data=pb2.NestData(chunk=b"", extra_contents=json.dumps({"seqId": self._seq, "epFlag": True})),
++                )
++                return
++            yield pb2.NestRequest(
++                type=pb2.RequestType.DATA,
++                data=pb2.NestData(chunk=item, extra_contents=json.dumps({"seqId": 0, "epFlag": False})),
++            )
++
++    async def _read(self, call) -> None:
++        try:
++            async for resp in call:
++                parsed = parse_response(resp.contents)
++                if parsed:
++                    await self.on_transcript(*parsed)
++        except grpc.aio.AioRpcError as e:
++            log.error("CLOVA 스트림 오류: %s %s", e.code(), e.details())
++            raise
++        except asyncio.CancelledError:
++            pass
++
++    async def _idle_watch(self) -> None:
++        try:
++            while True:
++                await asyncio.sleep(1)
++                if time.monotonic() - self._last_audio > self.idle_timeout:
++                    log.info("오디오 %ss 없음 → CLOVA 스트림 닫음", self.idle_timeout)
++                    async with self._lock:
++                        await self._shutdown(from_watchdog=True)
++                    return
++        except asyncio.CancelledError:
++            pass
++
++    async def _shutdown(self, from_watchdog: bool = False) -> None:
++        if self._queue is None:
++            return
++        await self._queue.put(_CLOSE)
++        if self._reader:
++            try:
++                await asyncio.wait_for(self._reader, timeout=5)
++            except (asyncio.TimeoutError, Exception):
++                self._reader.cancel()
++        if self._watchdog and not from_watchdog:
++            self._watchdog.cancel()
++        if self._channel:
++            await self._channel.close()
++        self._channel = self._queue = self._reader = self._watchdog = None
++        log.info("CLOVA 스트림 닫힘")
++
++    @property
++    def stream_error(self) -> BaseException | None:
++        """읽기 태스크가 오류로 끝났으면 그 예외 (파이프라인이 error 이벤트로 알림)."""
++        if self._reader and self._reader.done() and not self._reader.cancelled():
++            return self._reader.exception()
++        return None
+diff --git a/app/ai/stt/mock.py b/app/ai/stt/mock.py
+new file mode 100644
+index 0000000..52788ce
+--- /dev/null
++++ b/app/ai/stt/mock.py
+@@ -0,0 +1,42 @@
++"""
++개발용 가짜 STT — CLOVA 키 없이 오퍼레이터 화면/파이프라인을 붙여볼 때.
++
++실제로 소리를 알아듣지는 않는다. 오디오가 MOCK_STT_EVERY_SEC 초 분량 들어올 때마다
++아래 샘플 문장을 순서대로 하나씩 transcript 로 낸다.
++"""
++from app.ai import config
++from app.ai.stt import OnTranscript
++
++SAMPLE_LINES = [
++    "공연 시작 전 안내 말씀드립니다",
++    "공연 중 사진 및 영상 촬영은 금지되어 있습니다",
++    "잠시 후 15분간 인터미션이 있겠습니다",
++    "불이야 모두 도망쳐",  # 공연 대사 → NONE 이어야 함
++    "화재가 발생했습니다 가까운 비상구로 대피해 주십시오",
++]
++
++
++class MockSTTSession:
++    provider = "mock"
++
++    def __init__(self, on_transcript: OnTranscript, every_sec: float | None = None,
++                 lines: list[str] | None = None):
++        self.on_transcript = on_transcript
++        self.every_bytes = int((every_sec or config.MOCK_STT_EVERY_SEC) * config.BYTES_PER_SEC)
++        self.lines = lines or SAMPLE_LINES
++        self._received = 0
++        self._idx = 0
++
++    async def start(self) -> None:
++        pass
++
++    async def feed(self, pcm: bytes) -> None:
++        self._received += len(pcm)
++        while self._received >= self.every_bytes:
++            self._received -= self.every_bytes
++            line = self.lines[self._idx % len(self.lines)]
++            self._idx += 1
++            await self.on_transcript(line, True)
++
++    async def close(self) -> None:
++        pass
+diff --git a/app/ai/stt/proto/__init__.py b/app/ai/stt/proto/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/app/ai/stt/proto/nest.proto b/app/ai/stt/proto/nest.proto
+new file mode 100644
+index 0000000..f91e1db
+--- /dev/null
++++ b/app/ai/stt/proto/nest.proto
+@@ -0,0 +1,41 @@
++// CLOVA Speech 실시간 스트리밍 API 인터페이스
++//
++// ⚠️ 공식 문서의 nest.proto 와 반드시 대조할 것
++//    https://api.ncloud-docs.com/docs/ai-application-service-clovaspeech-grpc
++//    필드 번호가 다르면 서버가 요청을 해석하지 못한다.
++//    다르면 이 파일을 공식 파일로 덮어쓰고 scripts/gen_proto.sh 를 다시 실행한다.
++syntax = "proto3";
++
++option java_multiple_files = true;
++
++package com.nbp.cdncp.nest.grpc.proto.v1;
++
++enum RequestType {
++  CONFIG = 0;
++  DATA = 1;
++}
++
++message NestConfig {
++  string config = 1;
++}
++
++message NestData {
++  bytes chunk = 1;
++  string extra_contents = 2;
++}
++
++message NestRequest {
++  RequestType type = 1;
++  oneof part {
++    NestConfig config = 2;
++    NestData data = 3;
++  }
++}
++
++message NestResponse {
++  string contents = 1;
++}
++
++service NestService {
++  rpc recognize(stream NestRequest) returns (stream NestResponse) {};
++}
+diff --git a/app/ai/stt/proto/nest_pb2.py b/app/ai/stt/proto/nest_pb2.py
+new file mode 100644
+index 0000000..e448f87
+--- /dev/null
++++ b/app/ai/stt/proto/nest_pb2.py
+@@ -0,0 +1,47 @@
++# -*- coding: utf-8 -*-
++# Generated by the protocol buffer compiler.  DO NOT EDIT!
++# NO CHECKED-IN PROTOBUF GENCODE
++# source: app/ai/stt/proto/nest.proto
++# Protobuf Python Version: 7.35.1
++"""Generated protocol buffer code."""
++from google.protobuf import descriptor as _descriptor
++from google.protobuf import descriptor_pool as _descriptor_pool
++from google.protobuf import runtime_version as _runtime_version
++from google.protobuf import symbol_database as _symbol_database
++from google.protobuf.internal import builder as _builder
++_runtime_version.ValidateProtobufRuntimeVersion(
++    _runtime_version.Domain.PUBLIC,
++    7,
++    35,
++    1,
++    '',
++    'app/ai/stt/proto/nest.proto'
++)
++# @@protoc_insertion_point(imports)
++
++_sym_db = _symbol_database.Default()
++
++
++
++
++DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1b\x61pp/ai/stt/proto/nest.proto\x12 com.nbp.cdncp.nest.grpc.proto.v1\"\x1c\n\nNestConfig\x12\x0e\n\x06\x63onfig\x18\x01 \x01(\t\"1\n\x08NestData\x12\r\n\x05\x63hunk\x18\x01 \x01(\x0c\x12\x16\n\x0e\x65xtra_contents\x18\x02 \x01(\t\"\xce\x01\n\x0bNestRequest\x12;\n\x04type\x18\x01 \x01(\x0e\x32-.com.nbp.cdncp.nest.grpc.proto.v1.RequestType\x12>\n\x06\x63onfig\x18\x02 \x01(\x0b\x32,.com.nbp.cdncp.nest.grpc.proto.v1.NestConfigH\x00\x12:\n\x04\x64\x61ta\x18\x03 \x01(\x0b\x32*.com.nbp.cdncp.nest.grpc.proto.v1.NestDataH\x00\x42\x06\n\x04part\" \n\x0cNestResponse\x12\x10\n\x08\x63ontents\x18\x01 \x01(\t*#\n\x0bRequestType\x12\n\n\x06\x43ONFIG\x10\x00\x12\x08\n\x04\x44\x41TA\x10\x01\x32\x7f\n\x0bNestService\x12p\n\trecognize\x12-.com.nbp.cdncp.nest.grpc.proto.v1.NestRequest\x1a..com.nbp.cdncp.nest.grpc.proto.v1.NestResponse\"\x00(\x01\x30\x01\x42\x02P\x01\x62\x06proto3')
++
++_globals = globals()
++_builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
++_builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'app.ai.stt.proto.nest_pb2', _globals)
++if not _descriptor._USE_C_DESCRIPTORS:
++  _globals['DESCRIPTOR']._loaded_options = None
++  _globals['DESCRIPTOR']._serialized_options = b'P\001'
++  _globals['_REQUESTTYPE']._serialized_start=389
++  _globals['_REQUESTTYPE']._serialized_end=424
++  _globals['_NESTCONFIG']._serialized_start=65
++  _globals['_NESTCONFIG']._serialized_end=93
++  _globals['_NESTDATA']._serialized_start=95
++  _globals['_NESTDATA']._serialized_end=144
++  _globals['_NESTREQUEST']._serialized_start=147
++  _globals['_NESTREQUEST']._serialized_end=353
++  _globals['_NESTRESPONSE']._serialized_start=355
++  _globals['_NESTRESPONSE']._serialized_end=387
++  _globals['_NESTSERVICE']._serialized_start=426
++  _globals['_NESTSERVICE']._serialized_end=553
++# @@protoc_insertion_point(module_scope)
+diff --git a/app/ai/stt/proto/nest_pb2_grpc.py b/app/ai/stt/proto/nest_pb2_grpc.py
+new file mode 100644
+index 0000000..08bf3c5
+--- /dev/null
++++ b/app/ai/stt/proto/nest_pb2_grpc.py
+@@ -0,0 +1,97 @@
++# Generated by the gRPC Python protocol compiler plugin. DO NOT EDIT!
++"""Client and server classes corresponding to protobuf-defined services."""
++import grpc
++import warnings
++
++from app.ai.stt.proto import nest_pb2 as app_dot_ai_dot_stt_dot_proto_dot_nest__pb2
++
++GRPC_GENERATED_VERSION = '1.85.1'
++GRPC_VERSION = grpc.__version__
++_version_not_supported = False
++
++try:
++    from grpc._utilities import first_version_is_lower
++    _version_not_supported = first_version_is_lower(GRPC_VERSION, GRPC_GENERATED_VERSION)
++except ImportError:
++    _version_not_supported = True
++
++if _version_not_supported:
++    raise RuntimeError(
++        f'The grpc package installed is at version {GRPC_VERSION},'
++        + ' but the generated code in app/ai/stt/proto/nest_pb2_grpc.py depends on'
++        + f' grpcio>={GRPC_GENERATED_VERSION}.'
++        + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
++        + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
++    )
++
++
++class NestServiceStub:
++    """Missing associated documentation comment in .proto file."""
++
++    def __init__(self, channel):
++        """Constructor.
++
++        Args:
++            channel: A grpc.Channel.
++        """
++        self.recognize = channel.stream_stream(
++                '/com.nbp.cdncp.nest.grpc.proto.v1.NestService/recognize',
++                request_serializer=app_dot_ai_dot_stt_dot_proto_dot_nest__pb2.NestRequest.SerializeToString,
++                response_deserializer=app_dot_ai_dot_stt_dot_proto_dot_nest__pb2.NestResponse.FromString,
++                _registered_method=True)
++
++
++class NestServiceServicer:
++    """Missing associated documentation comment in .proto file."""
++
++    def recognize(self, request_iterator, context):
++        """Missing associated documentation comment in .proto file."""
++        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
++        context.set_details('Method not implemented!')
++        raise NotImplementedError('Method not implemented!')
++
++
++def add_NestServiceServicer_to_server(servicer, server):
++    rpc_method_handlers = {
++            'recognize': grpc.stream_stream_rpc_method_handler(
++                    servicer.recognize,
++                    request_deserializer=app_dot_ai_dot_stt_dot_proto_dot_nest__pb2.NestRequest.FromString,
++                    response_serializer=app_dot_ai_dot_stt_dot_proto_dot_nest__pb2.NestResponse.SerializeToString,
++            ),
++    }
++    generic_handler = grpc.method_handlers_generic_handler(
++            'com.nbp.cdncp.nest.grpc.proto.v1.NestService', rpc_method_handlers)
++    server.add_generic_rpc_handlers((generic_handler,))
++    server.add_registered_method_handlers('com.nbp.cdncp.nest.grpc.proto.v1.NestService', rpc_method_handlers)
++
++
++ # This class is part of an EXPERIMENTAL API.
++class NestService:
++    """Missing associated documentation comment in .proto file."""
++
++    @staticmethod
++    def recognize(request_iterator,
++            target,
++            options=(),
++            channel_credentials=None,
++            call_credentials=None,
++            insecure=False,
++            compression=None,
++            wait_for_ready=None,
++            timeout=None,
++            metadata=None):
++        return grpc.experimental.stream_stream(
++            request_iterator,
++            target,
++            '/com.nbp.cdncp.nest.grpc.proto.v1.NestService/recognize',
++            app_dot_ai_dot_stt_dot_proto_dot_nest__pb2.NestRequest.SerializeToString,
++            app_dot_ai_dot_stt_dot_proto_dot_nest__pb2.NestResponse.FromString,
++            options,
++            channel_credentials,
++            insecure,
++            call_credentials,
++            compression,
++            wait_for_ready,
++            timeout,
++            metadata,
++            _registered_method=True)
+diff --git a/app/main.py b/app/main.py
+index aa9d93e..763abba 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -9,11 +9,14 @@ W1 후반에 저장소만 SQLAlchemy 로 바꾸면 프론트는 수정 불필요
+ 문서:
+     http://localhost:8000/docs
+ """
++from pathlib import Path
++
+ from fastapi import FastAPI
+ from fastapi.middleware.cors import CORSMiddleware
++from fastapi.staticfiles import StaticFiles
+ 
+ from app import hub, store
+-from app.routers import auth, notices, stream
++from app.routers import auth, notices, operator, stream
+ 
+ app = FastAPI(
+     title="세이프큐 백엔드 (더미)",
+@@ -63,3 +66,9 @@ def intents():
+ app.include_router(auth.router, prefix="/api", tags=["auth"])
+ app.include_router(notices.router, prefix="/api", tags=["notices"])
+ app.include_router(stream.router, prefix="/api", tags=["stream"])
++app.include_router(operator.router, prefix="/api", tags=["operator"])
++
++# 개발용 마이크 테스트 페이지: http://localhost:8000/static/mic_test.html
++_static = Path(__file__).resolve().parents[1] / "static"
++if _static.is_dir():
++    app.mount("/static", StaticFiles(directory=_static), name="static")
+diff --git a/app/routers/operator.py b/app/routers/operator.py
+new file mode 100644
+index 0000000..7ca178e
+--- /dev/null
++++ b/app/routers/operator.py
+@@ -0,0 +1,96 @@
++"""
++오퍼레이터 WebSocket — 개발자 B 담당.
++
++    ws(s)://<host>/api/ws/operator
++
++인증 없음 (11/10 회의: 로그인 제외).
++
++클라이언트 → 서버
++  - (binary)            16kHz mono PCM16 오디오 (헤더 없음, little-endian)
++  - {"type": "ping"}
++
++서버 → 클라이언트
++  - {"type": "connected", "session_id", "stt_provider", "audio": {...}}
++  - {"type": "transcript", "text", "is_final", "ts"}
++  - {"type": "suggestion", "intent_type", "stt_text", "templates": [...], "ts"}
++  - {"type": "error", "code", "message"}
++  - {"type": "pong"}
++
++자세한 명세: docs/WS_OPERATOR.md
++"""
++import asyncio
++import json
++import logging
++import uuid
++
++from fastapi import APIRouter, WebSocket, WebSocketDisconnect
++
++from app import hub
++from app.ai import config
++from app.ai.pipeline import OperatorPipeline
++
++log = logging.getLogger("safeq.operator_ws")
++router = APIRouter()
++
++
++@router.websocket("/ws/operator")
++async def operator_socket(ws: WebSocket):
++    await ws.accept()
++
++    session_id = uuid.uuid4().hex[:12]
++    send_lock = asyncio.Lock()
++
++    async def send(msg: dict) -> None:
++        async with send_lock:  # 여러 태스크(STT, 분류)가 동시에 보내도 메시지가 섞이지 않게
++            await ws.send_json(msg)
++
++    pipeline = OperatorPipeline(send=send, session_id=session_id)
++    hub.add_operator(ws)
++    try:
++        try:
++            await pipeline.start()
++        except Exception as e:
++            log.exception("파이프라인 시작 실패")
++            await send({"type": "error", "code": "STT_UNAVAILABLE", "message": str(e)})
++
++        await send({
++            "type": "connected",
++            "session_id": session_id,
++            "stt_provider": pipeline.stt.provider,
++            "audio": {"format": "pcm_s16le", "sample_rate": config.SAMPLE_RATE, "channels": config.CHANNELS},
++        })
++
++        while True:
++            msg = await ws.receive()
++            if msg["type"] == "websocket.disconnect":
++                break
++            data = msg.get("bytes")
++            if data is not None:
++                if len(data) % 2:  # PCM16 은 2바이트 단위
++                    await send({"type": "error", "code": "BAD_AUDIO", "message": "PCM16 프레임 길이가 홀수입니다"})
++                    continue
++                try:
++                    await pipeline.feed_audio(data)
++                except Exception as e:
++                    log.warning("STT 처리 오류: %s", e)
++                    await send({"type": "error", "code": "STT_ERROR", "message": str(e)})
++                continue
++            await _handle_text(msg.get("text"), send)
++    except WebSocketDisconnect:
++        pass
++    finally:
++        hub.remove_operator(ws)
++        await pipeline.close()
++
++
++async def _handle_text(text: str | None, send) -> None:
++    try:
++        body = json.loads(text or "")
++    except json.JSONDecodeError:
++        await send({"type": "error", "code": "BAD_JSON", "message": "JSON 텍스트만 받습니다"})
++        return
++    kind = body.get("type") if isinstance(body, dict) else None
++    if kind == "ping":
++        await send({"type": "pong"})
++    else:
++        await send({"type": "error", "code": "UNKNOWN_TYPE", "message": f"알 수 없는 type: {kind}"})
+diff --git a/app/routers/stream.py b/app/routers/stream.py
+index bfa062f..5befab4 100644
+--- a/app/routers/stream.py
++++ b/app/routers/stream.py
+@@ -1,13 +1,12 @@
+ """
+-관객 SSE + 오퍼레이터 WebSocket.
++관객 SSE. 관객은 받기만 한다.
+ 
+-관객: 받기만 한다 (SSE)
+-오퍼레이터: 오디오를 올리고 추천을 받는다 (WebSocket)
++오퍼레이터 WebSocket 은 app/routers/operator.py (개발자 B).
+ """
+ import asyncio
+ import json
+ 
+-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
++from fastapi import APIRouter, Request
+ from sse_starlette.sse import EventSourceResponse
+ 
+ from app import hub, store
+@@ -61,43 +60,4 @@ async def stream_notices(request: Request):
+     return EventSourceResponse(gen())
+ 
+ 
+-@router.websocket("/ws/operator")
+-async def operator_socket(ws: WebSocket):
+-    """
+-    오퍼레이터 PC 연결.
+-
+-    - 올라오는 것: 마이크 오디오 조각 (더미에서는 무시. 저장하지 않음)
+-    - 내려가는 것: AI 추천 (개발자 B가 채울 자리. 지금은 가짜 추천)
+-
+-    더미에서는 15초마다 ETIQUETTE 추천을 한 번씩 보내서
+-    프론트가 추천 팝업 UI 를 만들 수 있게 한다.
+-    """
+-    await ws.accept()
+-    hub.add_operator(ws)
+-
+-    async def fake_suggestions():
+-        samples = ["ETIQUETTE", "DELAY", "INTERMISSION"]
+-        i = 0
+-        while True:
+-            await asyncio.sleep(15)
+-            intent = samples[i % len(samples)]
+-            i += 1
+-            await hub.send_suggestion({
+-                "event": "suggestion",
+-                "data": {
+-                    "intent_type": intent,
+-                    "stt_text": "(더미) 현장 음성에서 인식된 문장입니다",
+-                    "templates": store.templates_for_intent(intent),
+-                },
+-            })
+-
+-    task = asyncio.create_task(fake_suggestions())
+-    try:
+-        while True:
+-            # 오디오는 받기만 하고 버린다 (공연 녹음 금지)
+-            await ws.receive()
+-    except WebSocketDisconnect:
+-        pass
+-    finally:
+-        task.cancel()
+-        hub.remove_operator(ws)
++# 오퍼레이터 WebSocket 은 app/routers/operator.py 로 이동 (개발자 B 담당)
+diff --git a/docs/AI_PIPELINE.md b/docs/AI_PIPELINE.md
+new file mode 100644
+index 0000000..17b5dc7
+--- /dev/null
++++ b/docs/AI_PIPELINE.md
+@@ -0,0 +1,81 @@
++# AI 파이프라인 (개발자 B) — W1
++
++현장 음성 → **CLOVA Speech 실시간 스트리밍** → 텍스트 버퍼(최근 10초) → **GPT-4o-mini** 의도 분류 → 오퍼레이터 추천
++
++## 파일
++
++```
++app/
++├── routers/operator.py      오퍼레이터 WebSocket (/api/ws/operator, 인증 없음)
++└── ai/
++    ├── config.py            .env 설정
++    ├── intents.py           intent 목록·우선순위·설명(프롬프트용)
++    ├── buffer.py            최근 N초 텍스트 버퍼
++    ├── classifier.py        GPT-4o-mini 분류기 + 프롬프트 v1 (+ 개발용 키워드 분류기)
++    ├── pipeline.py          세션 하나의 흐름: 오디오 → STT → 버퍼 → 분류 → 추천
++    └── stt/
++        ├── __init__.py      STT 세션 인터페이스 (업체 교체 가능)
++        ├── clova.py         CLOVA gRPC 스트리밍
++        ├── mock.py          개발용 가짜 STT
++        └── proto/           nest.proto + 생성 코드
++static/
++├── mic_test.html            마이크 테스트 페이지 (개발용)
++└── pcm-worklet.js           16kHz PCM16 변환 AudioWorklet (프론트 재사용 가능)
++scripts/
++├── eval_intent.py           분류 평가 (정확도·혼동행렬·오경보)
++├── clova_file_test.py       CLOVA 단독 테스트 (WAV 파일 → 인식 결과)
++└── gen_proto.sh             nest.proto → Python 코드 생성
++tests/
++├── test_ai_pipeline.py      버퍼·분류기·파이프라인
++├── test_clova_grpc.py       CLOVA 클라이언트 (로컬 가짜 gRPC 서버)
++├── test_operator_ws.py      WebSocket 통합
++└── data/intent_testset.csv  분류 테스트셋 61문장
++```
++
++## 실행 순서
++
++```bash
++pip install -r requirements.txt
++cp .env.example .env          # 처음 한 번
++pytest -q                     # 키 없이 전부 통과해야 함
++uvicorn app.main:app --reload --port 8000
++# http://localhost:8000/static/mic_test.html
++```
++
++### 1) 키 없이 (mock)
++`.env`: `STT_PROVIDER=mock`, `LLM_PROVIDER=mock` → 마이크를 켜면 3초마다 샘플 문장 + 추천.
++프론트가 오퍼레이터 화면을 붙일 때 이 모드를 쓰면 된다.
++
++### 2) GPT-4o-mini 평가
++`.env`: `OPENAI_API_KEY=sk-...`
++```bash
++python -m scripts.eval_intent --provider mock     # 기준선 (키워드 규칙)
++python -m scripts.eval_intent --provider openai   # GPT-4o-mini
++```
++- 볼 것: **오경보(NONE → 추천)**, **비상 놓침**, 혼동행렬에서 자주 섞이는 쌍
++- 문장별 결과는 `tmp/eval_*.csv` (엑셀로 열림)
++- 프롬프트는 `app/ai/classifier.py` 의 `build_system_prompt()`, 설명은 `app/ai/intents.py` 의 `DEFINITIONS`
++
++### 3) CLOVA 연결
++1. 네이버 클라우드 콘솔 → CLOVA Speech → **스트리밍 인식** Domain 생성 → Secret Key (Free 플랜은 스트리밍 불가)
++2. **`app/ai/stt/proto/nest.proto` 를 공식 문서 파일과 대조** → 다르면 덮어쓰고 `bash scripts/gen_proto.sh`
++3. `.env`: `CLOVA_SECRET_KEY=...`
++4. 파일로 먼저 확인
++   ```bash
++   ffmpeg -i 녹음.m4a -ar 16000 -ac 1 -sample_fmt s16 test.wav
++   python -m scripts.clova_file_test test.wav
++   ```
++5. 되면 `.env`: `STT_PROVIDER=clova` → 마이크 테스트 페이지로 실시간 확인
++
++## 설계 메모
++
++- **CLOVA 요금**: 요청 단위 15초 올림 과금 → 청크마다 요청하지 않고 **연결 하나로 스트리밍**.
++  오디오가 30초(`STT_IDLE_TIMEOUT_SEC`) 안 오면 연결을 닫고, 다시 오면 새로 연다.
++- **확실하지 않으면 NONE**: 프롬프트 규칙 + 코드에서 이상한 응답·타임아웃·오류는 전부 `NONE` → 추천 없음.
++- **우선순위**: `FIRE > POWER_OUT > PAUSE > DELAY > INTERMISSION > ETIQUETTE` (프롬프트에 명시)
++- **추천 대상** = `LLM_INTENTS ∩ TEMPLATE_INTENTS` (6개). `NONE` 은 템플릿 없음, `INFO` 는 LLM 이 안 뱉음.
++- **템플릿 조회**: `store.templates_for_intent(intent)` (개발자 A). DB 로 바뀌어도 함수 이름 유지 합의 필요.
++- **인증 없음**: 11/10 회의에서 로그인 제외.
++- **픽토그램 키**: 디자인팀 확정 전. 확정되면 `data/templates.json` 의 `pictogram_code` 만 고친다 (코드 변경 없음).
++- **다국어**: v0.1 은 한/중/영. 일본어는 이후 추가.
++- **공연 녹음 금지**: 오디오는 저장하지 않는다. `DEBUG_SAVE_AUDIO=true` 일 때만 `tmp/recordings/` 에 저장 (gitignore 됨).
+diff --git a/docs/WS_OPERATOR.md b/docs/WS_OPERATOR.md
+new file mode 100644
+index 0000000..3dea7c1
+--- /dev/null
++++ b/docs/WS_OPERATOR.md
+@@ -0,0 +1,119 @@
++# 오퍼레이터 WebSocket 명세
++
++담당: 개발자 B · 피드백 #2~#4 반영
++
++```
++ws://localhost:8000/api/ws/operator      # 로컬
++wss://<AWS 서버>/api/ws/operator          # 배포 (HTTPS 페이지에서는 wss)
++```
++
++- **인증 없음** (11/10 회의: 로그인 제외). 연결하면 바로 `connected` 가 온다.
++- 오퍼레이터 화면 1개 = 연결 1개 = CLOVA 스트림 1개.
++- 서버는 오디오를 **저장하지 않는다** (공연 녹음 금지).
++
++---
++
++## 1. 클라이언트 → 서버
++
++| type | 형식 | 설명 |
++|---|---|---|
++| (오디오) | **binary** | 16kHz · mono · PCM16 little-endian · 헤더 없음. **100ms(3,200바이트) 단위 권장** |
++| `ping` | `{"type": "ping"}` | 연결 유지. 20~30초마다 |
++
++오디오 만들기: `static/pcm-worklet.js` (AudioWorklet) 를 그대로 쓰면 된다.
++브라우저 기본 샘플레이트(44.1/48kHz)를 worklet 안에서 16kHz 로 바꿔 Int16 으로 보낸다.
++
++```js
++const ctx = new AudioContext();
++await ctx.audioWorklet.addModule('/static/pcm-worklet.js');
++const src = ctx.createMediaStreamSource(await navigator.mediaDevices.getUserMedia({ audio: true }));
++const node = new AudioWorkletNode(ctx, 'pcm-worklet');
++node.port.onmessage = (e) => ws.readyState === 1 && ws.send(e.data);  // ArrayBuffer
++src.connect(node);
++```
++
++## 2. 서버 → 클라이언트
++
++모든 메시지는 JSON 이고 `type` 으로 구분한다.
++
++### `connected` — 연결·인증 성공
++```json
++{
++  "type": "connected",
++  "session_id": "3f9a1c2b7d10",
++  "user": {"id": 1, "name": "오퍼레이터"},
++  "stt_provider": "clova",
++  "audio": {"format": "pcm_s16le", "sample_rate": 16000, "channels": 1}
++}
++```
++이 메시지를 받은 뒤 오디오 전송을 시작한다.
++
++### `transcript` — 실시간 자막 (피드백 #4)
++```json
++{"type": "transcript", "text": "화재가 발생했습니다", "is_final": true, "ts": "2026-11-15T10:00:00+00:00"}
++```
++| 필드 | 설명 |
++|---|---|
++| `is_final: false` | 중간 결과. 화면에서 **직전 중간 결과를 덮어쓴다** |
++| `is_final: true` | 확정 문장. 로그에 한 줄 추가 |
++
++> CLOVA 스트리밍은 문장 끝을 감지(EPD)할 때 그 구간 결과를 한 번에 주기 때문에 현재는 `true` 만 온다.
++> 프론트는 `false` 처리도 넣어 두면 나중에 STT 를 바꿔도 그대로 동작한다.
++
++### `suggestion` — AI 추천
++```json
++{
++  "type": "suggestion",
++  "intent_type": "ETIQUETTE",
++  "stt_text": "공연 중 사진 및 영상 촬영은 금지되어 있습니다",
++  "templates": [
++    {"template_code": "ETIQUETTE_PHOTO", "intent_type": "ETIQUETTE", "pictogram_code": "no_photo",
++     "needs_direction": false, "needs_duration": false,
++     "text_ko": "공연 중 촬영은 금지됩니다", "text_zh": "演出期间禁止拍照", "text_en": "No photography during the show", "...": "..."},
++    {"template_code": "ETIQUETTE_FOOD", "...": "..."}
++  ],
++  "ts": "2026-11-15T10:00:03+00:00"
++}
++```
++- `templates` = 해당 intent 의 템플릿 **전부** (`GET /api/templates` 의 항목과 같은 객체, 한/중/영). 오퍼레이터가 하나를 고른다.
++- `pictogram_code` 이름은 디자인팀과 **확정 전**이다. 확정되면 `data/templates.json` 만 바뀌고 이 형식은 그대로다.
++- 비상(`FIRE`, `POWER_OUT`)은 템플릿이 하나라 바로 하나만 온다.
++- 고른 뒤 송출은 `POST /api/notices` (`template_code` + 필요하면 `direction` / `duration_min`).
++- **관객에게는 아무것도 가지 않는다.** 오퍼레이터가 [송출] 을 눌러야 나간다.
++- 같은 intent 는 **30초 안에 다시 추천하지 않는다** (`SUGGEST_COOLDOWN_SEC`).
++- AI 가 확실하지 않으면(`NONE`) 아무것도 보내지 않는다.
++
++### `error`
++```json
++{"type": "error", "code": "STT_ERROR", "message": "..."}
++```
++| code | 의미 | 연결 |
++|---|---|---|
++| `STT_UNAVAILABLE` | STT 시작 실패 (키 없음 등) | 유지 (자막·추천만 안 됨) |
++| `STT_ERROR` | STT 처리 중 오류 | 유지. 다음 오디오에서 자동 재연결 |
++| `BAD_AUDIO` | PCM16 형식 아님 (홀수 바이트) | 유지 |
++| `BAD_JSON` / `UNKNOWN_TYPE` | 텍스트 메시지 형식 오류 | 유지 |
++
++### `pong`
++```json
++{"type": "pong"}
++```
++
++## 3. 순서 예시
++
++```
++클라  ── connect ───────────────────────▶ 서버
++클라  ◀──────────── connected ────────── 서버
++클라  ── PCM 100ms ×N ─────────────────▶ 서버 ──▶ CLOVA
++클라  ◀──────────── transcript ───────── 서버 ◀── CLOVA
++클라  ◀──────────── suggestion ───────── 서버 (GPT-4o-mini 분류 → 템플릿 조회)
++클라  ── POST /api/notices (REST) ─────▶ 서버 ──▶ 관객 SSE
++```
++
++## 4. 직접 테스트
++
++1. `uvicorn app.main:app --reload --port 8000`
++2. 브라우저에서 `http://localhost:8000/static/mic_test.html`
++3. WebSocket 연결 → 마이크 시작
++
++`.env` 에서 `STT_PROVIDER=mock` 이면 키 없이도 3초마다 샘플 문장이 transcript 로 오고 추천이 뜬다.
+diff --git a/requirements.txt b/requirements.txt
+index b0f95fe..ccead84 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -8,3 +8,13 @@ sqlalchemy
+ bcrypt
+ python-jose[cryptography]
+ python-dotenv
++
++# 음성 트랙 (개발자 B)
++openai>=1.40
++grpcio>=1.85.1          # app/ai/stt/proto/*_pb2_grpc.py 생성 버전과 맞춤
++grpcio-tools>=1.85.1    # proto 재생성용 (scripts/gen_proto.sh)
++protobuf>=7.35.1         # nest_pb2.py 생성 버전과 맞춤
++
++# 테스트
++pytest
++httpx
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/scripts/clova_file_test.py b/scripts/clova_file_test.py
+new file mode 100644
+index 0000000..59b55f7
+--- /dev/null
++++ b/scripts/clova_file_test.py
+@@ -0,0 +1,52 @@
++"""
++CLOVA 스트리밍 단독 테스트 — 녹음 파일을 실시간처럼 흘려보내고 인식 결과를 출력한다.
++서버/프론트 없이 CLOVA 연결(키, proto, 인증)만 먼저 확인할 때 쓴다.
++
++준비: 16kHz mono 16bit WAV 파일
++    ffmpeg -i 원본.m4a -ar 16000 -ac 1 -sample_fmt s16 test.wav
++
++사용법 (레포 루트, .env 에 CLOVA_SECRET_KEY 설정 후):
++    python -m scripts.clova_file_test test.wav
++    python -m scripts.clova_file_test test.wav --fast   # 기다리지 않고 바로 전송
++"""
++import argparse
++import asyncio
++import time
++import wave
++
++from app.ai import config
++from app.ai.stt.clova import ClovaStreamSession
++
++FRAME_MS = 100
++
++
++async def main(path: str, fast: bool) -> None:
++    with wave.open(path, "rb") as w:
++        assert w.getframerate() == config.SAMPLE_RATE, f"샘플레이트가 {w.getframerate()}Hz 입니다. 16000Hz 로 변환하세요"
++        assert w.getnchannels() == 1, "mono 파일이 필요합니다"
++        assert w.getsampwidth() == 2, "16bit 파일이 필요합니다"
++        pcm = w.readframes(w.getnframes())
++
++    t0 = time.perf_counter()
++
++    async def on_transcript(text: str, is_final: bool) -> None:
++        print(f"[{time.perf_counter() - t0:6.2f}s] {'확정' if is_final else '중간'}: {text}")
++
++    session = ClovaStreamSession(on_transcript)
++    await session.start()
++    step = config.BYTES_PER_SEC * FRAME_MS // 1000
++    print(f"전송 시작: {len(pcm) / config.BYTES_PER_SEC:.1f}초 분량")
++    for i in range(0, len(pcm), step):
++        await session.feed(pcm[i:i + step])
++        if not fast:
++            await asyncio.sleep(FRAME_MS / 1000)
++    print("전송 끝 → 남은 결과 대기")
++    await session.close()
++
++
++if __name__ == "__main__":
++    ap = argparse.ArgumentParser()
++    ap.add_argument("wav")
++    ap.add_argument("--fast", action="store_true")
++    a = ap.parse_args()
++    asyncio.run(main(a.wav, a.fast))
+diff --git a/scripts/eval_intent.py b/scripts/eval_intent.py
+new file mode 100644
+index 0000000..e61f971
+--- /dev/null
++++ b/scripts/eval_intent.py
+@@ -0,0 +1,110 @@
++"""
++LLM 의도 분류 평가 — 테스트셋으로 정확도, 혼동행렬, 오경보를 본다.
++
++사용법 (레포 루트에서):
++    python -m scripts.eval_intent                      # .env 의 LLM_PROVIDER 사용
++    python -m scripts.eval_intent --provider openai    # GPT-4o-mini
++    python -m scripts.eval_intent --provider mock      # 키워드 규칙 (비교 기준선)
++
++결과: 화면 출력 + tmp/eval_<provider>_<시각>.csv (문장별 예측)
++"""
++import argparse
++import asyncio
++import csv
++import time
++from collections import Counter
++from datetime import datetime
++from pathlib import Path
++
++from app.ai.classifier import make_classifier
++from app.ai.intents import LLM_INTENTS
++
++ROOT = Path(__file__).resolve().parents[1]
++DEFAULT_SET = ROOT / "tests" / "data" / "intent_testset.csv"
++EMERGENCY = {"FIRE", "POWER_OUT"}
++
++
++def load(path: Path) -> list[dict]:
++    with path.open(encoding="utf-8") as f:
++        return [r for r in csv.DictReader(f) if r["text"].strip()]
++
++
++async def run(rows: list[dict], provider: str, concurrency: int) -> list[dict]:
++    clf = make_classifier(provider)
++    sem = asyncio.Semaphore(concurrency)
++
++    async def one(r):
++        async with sem:
++            t0 = time.perf_counter()
++            pred = await clf.classify(r["text"])
++            return {**r, "pred": pred, "ms": round((time.perf_counter() - t0) * 1000)}
++
++    return await asyncio.gather(*(one(r) for r in rows))
++
++
++def report(results: list[dict]) -> None:
++    labels = list(LLM_INTENTS)
++    n = len(results)
++    correct = sum(r["gold"] == r["pred"] for r in results)
++    print(f"\n정확도: {correct}/{n} = {correct / n:.1%}")
++    print(f"평균 응답 시간: {sum(r['ms'] for r in results) / n:.0f} ms")
++
++    # 혼동행렬 (행=정답, 열=예측)
++    cm = Counter((r["gold"], r["pred"]) for r in results)
++    short = {l: l[:5] for l in labels}
++    print("\n혼동행렬 (행=정답, 열=예측)")
++    print(" " * 13 + "".join(f"{short[l]:>7}" for l in labels))
++    for g in labels:
++        print(f"{g:>12} " + "".join(f"{cm[(g, p)]:>7}" for p in labels))
++
++    print("\nintent별 정밀도 / 재현율")
++    for l in labels:
++        tp = cm[(l, l)]
++        pred_n = sum(cm[(g, l)] for g in labels)
++        gold_n = sum(cm[(l, p)] for p in labels)
++        prec = tp / pred_n if pred_n else 0
++        rec = tp / gold_n if gold_n else 0
++        print(f"  {l:>12}  정밀도 {prec:5.0%}  재현율 {rec:5.0%}  (정답 {gold_n}개)")
++
++    # 오경보: 정답이 NONE 인데 무언가를 추천 / 비상이 아닌데 비상으로 추천
++    false_alarm = [r for r in results if r["gold"] == "NONE" and r["pred"] != "NONE"]
++    false_emergency = [r for r in results if r["gold"] not in EMERGENCY and r["pred"] in EMERGENCY]
++    missed_emergency = [r for r in results if r["gold"] in EMERGENCY and r["pred"] != r["gold"]]
++    print(f"\n오경보 (NONE → 추천): {len(false_alarm)}건")
++    for r in false_alarm:
++        print(f"   - [{r['pred']}] {r['text']}  ({r['note']})")
++    print(f"비상 오경보 (비상 아님 → FIRE/POWER_OUT): {len(false_emergency)}건")
++    for r in false_emergency:
++        print(f"   - [{r['gold']}→{r['pred']}] {r['text']}")
++    print(f"비상 놓침 (FIRE/POWER_OUT 을 다른 것으로): {len(missed_emergency)}건")
++    for r in missed_emergency:
++        print(f"   - [{r['gold']}→{r['pred']}] {r['text']}")
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--provider", default=None, help="openai | mock (기본: .env LLM_PROVIDER)")
++    ap.add_argument("--testset", type=Path, default=DEFAULT_SET)
++    ap.add_argument("--concurrency", type=int, default=5)
++    args = ap.parse_args()
++
++    from app.ai import config
++
++    provider = args.provider or config.LLM_PROVIDER
++    rows = load(args.testset)
++    print(f"테스트셋 {len(rows)}문장 · 분류기 {provider}")
++    results = asyncio.run(run(rows, provider, args.concurrency))
++    report(results)
++
++    out = ROOT / "tmp" / f"eval_{provider}_{datetime.now():%m%d_%H%M}.csv"
++    out.parent.mkdir(exist_ok=True)
++    with out.open("w", encoding="utf-8-sig", newline="") as f:
++        w = csv.DictWriter(f, fieldnames=["text", "gold", "pred", "ms", "note"])
++        w.writeheader()
++        for r in results:
++            w.writerow({k: r[k] for k in w.fieldnames})
++    print(f"\n문장별 결과: {out.relative_to(ROOT)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/gen_proto.sh b/scripts/gen_proto.sh
+new file mode 100644
+index 0000000..1e3232a
+--- /dev/null
++++ b/scripts/gen_proto.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++# nest.proto → Python gRPC 코드 생성
++# 레포 루트에서 실행: bash scripts/gen_proto.sh
++set -euo pipefail
++cd "$(dirname "$0")/.."
++python -m grpc_tools.protoc -I. \
++  --python_out=. --grpc_python_out=. \
++  app/ai/stt/proto/nest.proto
++echo "생성 완료: app/ai/stt/proto/nest_pb2.py, nest_pb2_grpc.py"
+diff --git a/static/mic_test.html b/static/mic_test.html
+new file mode 100644
+index 0000000..04f4db8
+--- /dev/null
++++ b/static/mic_test.html
+@@ -0,0 +1,138 @@
++<!doctype html>
++<html lang="ko">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>세이프큐 · 오퍼레이터 마이크 테스트 (개발용)</title>
++<style>
++  body { font-family: system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; color: #1f2328; }
++  h1 { font-size: 20px; }
++  fieldset { border: 1px solid #d0d7de; border-radius: 8px; margin-bottom: 16px; }
++  input, button { font-size: 14px; padding: 6px 10px; margin: 4px 4px 4px 0; }
++  button { cursor: pointer; }
++  #status { font-weight: 600; }
++  #level { width: 200px; height: 10px; background: #eaeef2; display: inline-block; vertical-align: middle; border-radius: 5px; overflow: hidden; }
++  #level > div { height: 100%; width: 0; background: #2da44e; }
++  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
++  .box { border: 1px solid #d0d7de; border-radius: 8px; padding: 8px 12px; height: 340px; overflow-y: auto; font-size: 14px; }
++  .partial { color: #8c959f; }
++  .sug { border-left: 4px solid #cf222e; padding: 6px 8px; margin: 8px 0; background: #fff8f8; }
++  .tpl { margin: 4px 0 4px 8px; }
++  .err { color: #cf222e; }
++  small { color: #57606a; }
++</style>
++</head>
++<body>
++<h1>오퍼레이터 마이크 테스트 <small>(개발용 · 오디오는 저장되지 않음)</small></h1>
++
++<fieldset>
++  <legend>연결 · 마이크</legend>
++  <button id="btnConnect">WebSocket 연결</button>
++  <button id="btnMic" disabled>마이크 시작</button>
++  <button id="btnStop" disabled>정지</button>
++  <span id="status">대기</span> &nbsp; 입력 <span id="level"><div></div></span>
++  <div><small>16kHz · mono · PCM16 · 100ms 프레임 · 전송 <span id="sent">0</span> KB</small></div>
++</fieldset>
++
++<div class="cols">
++  <div><b>transcript</b><div id="transcripts" class="box"></div></div>
++  <div><b>suggestion / error</b><div id="events" class="box"></div></div>
++</div>
++
++<script>
++const $ = (id) => document.getElementById(id);
++const API = location.origin;              // 같은 서버에서 열면 그대로 동작
++let ws = null, ctx = null, stream = null, node = null, sentBytes = 0, pingTimer = null;
++
++$("btnConnect").onclick = () => {
++  const url = `${API.replace(/^http/, "ws")}/api/ws/operator`;
++  ws = new WebSocket(url);
++  ws.binaryType = "arraybuffer";
++  ws.onopen = () => {
++    setStatus("연결됨");
++    pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: "ping" })), 20000);
++  };
++  ws.onclose = (e) => { setStatus(`연결 종료 (${e.code})`); clearInterval(pingTimer); stopMic(); $("btnMic").disabled = true; };
++  ws.onmessage = (e) => handle(JSON.parse(e.data));
++};
++
++function handle(msg) {
++  switch (msg.type) {
++    case "connected":
++      setStatus(`연결됨 · STT=${msg.stt_provider}`);
++      $("btnMic").disabled = false;
++      break;
++    case "transcript": {
++      const box = $("transcripts");
++      const last = box.lastElementChild;
++      if (last && last.classList.contains("partial")) last.remove();  // 중간 결과는 덮어쓰기
++      const p = document.createElement("div");
++      p.textContent = msg.text;
++      if (!msg.is_final) p.classList.add("partial");
++      box.appendChild(p); box.scrollTop = box.scrollHeight;
++      break;
++    }
++    case "suggestion": {
++      const d = document.createElement("div");
++      d.className = "sug";
++      d.innerHTML = `<b>추천: ${msg.intent_type}</b><br><small>${escapeHtml(msg.stt_text)}</small>`;
++      for (const t of msg.templates) {
++        const row = document.createElement("div");
++        row.className = "tpl";
++        row.textContent = `· [${t.template_code}] ${t.text_ko} / ${t.text_zh}`;
++        d.appendChild(row);
++      }
++      $("events").appendChild(d); $("events").scrollTop = $("events").scrollHeight;
++      break;
++    }
++    case "error": {
++      const d = document.createElement("div");
++      d.className = "err"; d.textContent = `error ${msg.code}: ${msg.message}`;
++      $("events").appendChild(d);
++      break;
++    }
++  }
++}
++
++$("btnMic").onclick = async () => {
++  stream = await navigator.mediaDevices.getUserMedia({
++    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true },
++  });
++  ctx = new AudioContext();                      // 기본 샘플레이트로 열고 worklet 에서 16kHz 로 변환
++  await ctx.audioWorklet.addModule("pcm-worklet.js");
++  const src = ctx.createMediaStreamSource(stream);
++  node = new AudioWorkletNode(ctx, "pcm-worklet");
++  node.port.onmessage = (e) => {
++    if (ws && ws.readyState === 1) {
++      ws.send(e.data);                           // ArrayBuffer (Int16 PCM)
++      sentBytes += e.data.byteLength;
++      $("sent").textContent = (sentBytes / 1024).toFixed(0);
++      showLevel(new Int16Array(e.data));
++    }
++  };
++  src.connect(node);
++  setStatus(`녹음 중 (입력 ${ctx.sampleRate}Hz → 16000Hz)`);
++  $("btnMic").disabled = true; $("btnStop").disabled = false;
++};
++
++$("btnStop").onclick = () => { stopMic(); $("btnMic").disabled = !(ws && ws.readyState === 1); };
++
++function stopMic() {
++  if (node) node.disconnect();
++  if (stream) stream.getTracks().forEach((t) => t.stop());
++  if (ctx) ctx.close();
++  node = stream = ctx = null;
++  $("btnStop").disabled = true;
++  $("level").firstElementChild.style.width = "0";
++}
++
++function showLevel(pcm) {
++  let peak = 0;
++  for (let i = 0; i < pcm.length; i += 8) peak = Math.max(peak, Math.abs(pcm[i]));
++  $("level").firstElementChild.style.width = `${Math.min(100, (peak / 32768) * 160)}%`;
++}
++function setStatus(s) { $("status").textContent = s; }
++function escapeHtml(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
++</script>
++</body>
++</html>
+diff --git a/static/pcm-worklet.js b/static/pcm-worklet.js
+new file mode 100644
+index 0000000..515e09e
+--- /dev/null
++++ b/static/pcm-worklet.js
+@@ -0,0 +1,45 @@
++// AudioWorklet: 마이크 입력(보통 44.1/48kHz Float32) → 16kHz mono PCM16 (little-endian)
++// 100ms(1600샘플 = 3,200바이트)마다 메인 스레드로 보낸다.
++// 프론트 오퍼레이터 화면에서 그대로 가져다 써도 된다.
++class PcmWorklet extends AudioWorkletProcessor {
++  constructor() {
++    super();
++    this.targetRate = 16000;
++    this.ratio = sampleRate / this.targetRate; // sampleRate: AudioWorkletGlobalScope 전역
++    this.frameSamples = 1600; // 100ms
++    this.out = new Int16Array(this.frameSamples);
++    this.outIdx = 0;
++    this.acc = 0; // 다운샘플링 누적값
++    this.accCount = 0;
++    this.pos = 0; // 다음 출력 샘플 경계까지 남은 입력 샘플
++  }
++
++  process(inputs) {
++    const input = inputs[0];
++    if (!input || input.length === 0) return true;
++    const ch = input[0]; // mono: 첫 채널만 사용
++
++    for (let i = 0; i < ch.length; i++) {
++      // 구간 평균으로 다운샘플링 (간단한 저역통과 효과)
++      this.acc += ch[i];
++      this.accCount++;
++      this.pos += 1;
++      if (this.pos >= this.ratio) {
++        this.pos -= this.ratio;
++        let s = this.acc / this.accCount;
++        this.acc = 0;
++        this.accCount = 0;
++        s = Math.max(-1, Math.min(1, s));
++        this.out[this.outIdx++] = s < 0 ? s * 0x8000 : s * 0x7fff;
++        if (this.outIdx === this.frameSamples) {
++          this.port.postMessage(this.out.buffer, [this.out.buffer]);
++          this.out = new Int16Array(this.frameSamples);
++          this.outIdx = 0;
++        }
++      }
++    }
++    return true;
++  }
++}
++
++registerProcessor("pcm-worklet", PcmWorklet);
+diff --git a/tests/data/intent_testset.csv b/tests/data/intent_testset.csv
+new file mode 100644
+index 0000000..6f79530
+--- /dev/null
++++ b/tests/data/intent_testset.csv
+@@ -0,0 +1,62 @@
++text,gold,note
++화재가 발생했습니다 관객 여러분께서는 가까운 비상구로 대피해 주십시오,FIRE,정상
++아아 화재가 발생했... 비상구로 대파하시기 바랍,FIRE,STT 깨짐
++불이 났습니다 직원의 안내에 따라 침착하게 밖으로 이동해 주세요,FIRE,정상
++관객 여러분 지금 즉시 공연장 밖으로 대피해 주시기 바랍니다,FIRE,정상
++지진이 감지되었습니다 머리를 보호하시고 안내에 따라 대피해 주십시오,FIRE,자연재해
++비상 상황입니다 좌석에서 일어나 왼쪽 출구로 이동해 주세요,FIRE,정상
++화재 경보가 울렸습니다 엘리베이터를 이용하지 마시고 계단으로,FIRE,정상
++연기가 감지되어 대피 안내드립니다 비상구 방향으로,FIRE,STT 깨짐
++불이 났... 밖으로 나가... 대피...,FIRE,STT 깨짐
++정전이 발생했습니다 잠시 자리에서 기다려 주십시오,POWER_OUT,정상
++현재 전기 공급에 문제가 생겨 조명이 꺼졌습니다,POWER_OUT,정상
++음향 장비 이상으로 잠시 소리가 나오지 않습니다,POWER_OUT,설비
++정전으로 공연을 잠시 중단합니다,POWER_OUT,우선순위 POWER_OUT>PAUSE
++전원 문제로 무대 조명이 꺼졌... 복구 중입니다,POWER_OUT,STT 깨짐
++설비 점검 중이니 자리를 지켜 주시기 바랍니다 정전,POWER_OUT,정상
++갑작스러운 정전으로 불편을 드려 죄송합니다,POWER_OUT,정상
++정전... 잠시만 기다려... 복구...,POWER_OUT,STT 깨짐
++관객 여러분 무대 점검을 위해 공연을 잠시 중단하겠습니다,PAUSE,정상
++공연을 잠시 멈추겠습니다 자리에서 기다려 주세요,PAUSE,정상
++객석에 응급 환자가 있어 공연을 잠시 중단합니다,PAUSE,정상
++잠시 공연이 중단... 재개 시 안내... 드리겠습니다,PAUSE,STT 깨짐
++안전 점검으로 공연이 일시 중지됩니다,PAUSE,정상
++무대 장치 문제로 잠시 공연을 멈춥니다 양해 부탁드립니다,PAUSE,정상
++공연 재개까지 약 5분 정도 소요될 예정입니다 잠시 중단,PAUSE,정상
++공연 시작이 10분 지연되겠습니다 양해 부탁드립니다,DELAY,정상
++관객 입장이 늦어져 공연 시작을 잠시 미루겠습니다,DELAY,정상
++오늘 공연은 예정보다 늦게 시작합니다,DELAY,정상
++공연 시작... 지연... 15분 후 시작합니다,DELAY,STT 깨짐
++현장 사정으로 개막이 지연되고 있습니다,DELAY,정상
++잠시 후 공연을 시작하겠습니다 시작 시간이 다소 늦어진 점,DELAY,정상
++공연 시작 시간이 7시 30분으로 변경되었습니다,DELAY,정상
++지금부터 15분간 인터미션이 있겠습니다,INTERMISSION,정상
++1부 공연이 끝났습니다 20분간 휴식 후 2부를 시작하겠습니다,INTERMISSION,정상
++인터미션이 곧 종료됩니다 자리로 돌아와 주십시오,INTERMISSION,종료 안내
++쉬는 시간입니다 화장실은 로비 양쪽에 있습니다,INTERMISSION,정상
++인터... 미션... 15분... 후 2부,INTERMISSION,STT 깨짐
++2부 공연이 5분 후 시작됩니다 좌석으로 돌아와 주세요,INTERMISSION,종료 안내
++중간 휴식 시간 동안 로비에서 음료를 즐기실 수 있습니다,INTERMISSION,정상
++공연 중 사진 및 영상 촬영은 금지되어 있습니다,ETIQUETTE,정상
++휴대전화는 전원을 꺼 주시거나 무음으로 설정해 주십시오,ETIQUETTE,정상
++공연장 안에서는 음식물 섭취를 삼가 주시기 바랍니다,ETIQUETTE,정상
++녹음과 촬영은 저작권법에 의해 금지되어 있습니다,ETIQUETTE,정상
++촬영... 금지... 휴대폰 꺼...,ETIQUETTE,STT 깨짐
++공연 중에는 옆 사람과의 대화를 자제해 주십시오,ETIQUETTE,정상
++플래시를 사용한 사진 촬영은 배우에게 위험할 수 있습니다,ETIQUETTE,정상
++불이야 모두 도망쳐,NONE,대사 함정
++이 성에 불을 질러라 모두 태워 버려,NONE,대사 함정
++사랑해 너만을 기다렸어,NONE,대사
++오늘 밤 별이 빛나는 이 거리에서,NONE,노래 가사
++아 여기 자리 맞아요,NONE,관객 잡담
++저 사람 연기 진짜 잘한다,NONE,관객 잡담
++음 어 그 아,NONE,소음
++아아 마이크 테스트 하나 둘,NONE,잡음
++도망쳐 여기 무너진다,NONE,대사 함정
++불꽃처럼 타오르는 내 마음,NONE,노래 가사
++휴대폰 어디 뒀지,NONE,관객 잡담 함정
++끝나고 저녁 뭐 먹을래,NONE,관객 잡담
++쉬는 시간에 화장실 가자,NONE,관객 잡담 함정
++정전된 줄 알았네 깜짝이야,NONE,관객 잡담 함정
++멈춰 거기 서,NONE,대사 함정
++박수 박수,NONE,소음
+diff --git a/tests/test_ai_pipeline.py b/tests/test_ai_pipeline.py
+new file mode 100644
+index 0000000..c7f07c7
+--- /dev/null
++++ b/tests/test_ai_pipeline.py
+@@ -0,0 +1,202 @@
++"""
++개발자 B — AI 파이프라인 테스트. 외부 API 키 없이 돈다.
++
++    pytest -q tests/test_ai_pipeline.py
++"""
++import asyncio
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from app import store
++from app.ai import config, intents
++from app.ai.buffer import TextBuffer
++from app.ai.classifier import KeywordClassifier, OpenAIClassifier, build_system_prompt, parse_intent
++from app.ai.pipeline import OperatorPipeline
++from app.ai.stt.clova import build_config, parse_response
++from app.ai.stt.mock import MockSTTSession
++
++
++# ── intent 목록이 A 쪽 store.py 와 일치하는지 ─────────────────────────
++def test_intents_match_store():
++    assert tuple(store.LLM_INTENTS) == intents.LLM_INTENTS
++    assert tuple(store.TEMPLATE_INTENTS) == intents.TEMPLATE_INTENTS
++    assert list(store.PRIORITY) == intents.PRIORITY
++    assert set(intents.SUGGESTABLE) == {"FIRE", "POWER_OUT", "PAUSE", "DELAY", "INTERMISSION", "ETIQUETTE"}
++
++
++def test_every_suggestable_intent_has_template():
++    store.load_templates()
++    for i in intents.SUGGESTABLE:
++        assert store.templates_for_intent(i), f"{i} 템플릿 없음"
++
++
++# ── 버퍼 ────────────────────────────────────────────────────────────
++def test_buffer_keeps_only_window():
++    now = [0.0]
++    b = TextBuffer(window_sec=10, clock=lambda: now[0])
++    b.add("화재가 발생했")
++    now[0] = 5
++    b.add("비상구로 대피")
++    assert b.text() == "화재가 발생했 비상구로 대피"
++    now[0] = 12  # 첫 문장은 10초 지남
++    assert b.text() == "비상구로 대피"
++    b.clear()
++    assert b.text() == "" and len(b) == 0
++
++
++# ── 분류기 ──────────────────────────────────────────────────────────
++@pytest.mark.parametrize("raw,expected", [
++    ('{"intent": "FIRE"}', "FIRE"),
++    ('{"intent": "fire"}', "FIRE"),
++    ('결과: {"intent": "PAUSE"} 입니다', "PAUSE"),
++    ('{"intent": "INFO"}', "NONE"),        # INFO 는 LLM 이 뱉으면 안 됨
++    ('{"intent": "EARTHQUAKE"}', "NONE"),  # 목록 밖
++    ('{"label": "FIRE"}', "NONE"),
++    ("FIRE", "NONE"),
++    ("", "NONE"),
++    (None, "NONE"),
++])
++def test_parse_intent(raw, expected):
++    assert parse_intent(raw) == expected
++
++
++def test_prompt_has_rules():
++    p = build_system_prompt()
++    assert "확실하지 않으면 NONE" in p
++    assert "FIRE > POWER_OUT > PAUSE > DELAY > INTERMISSION > ETIQUETTE" in p
++    for k in intents.LLM_INTENTS:
++        assert k in p
++
++
++class _FakeCompletions:
++    def __init__(self, content=None, exc=None):
++        self.content, self.exc, self.kwargs = content, exc, None
++
++    async def create(self, **kwargs):
++        self.kwargs = kwargs
++        if self.exc:
++            raise self.exc
++        msg = SimpleNamespace(content=self.content)
++        return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
++
++
++def _fake_client(**kw):
++    comp = _FakeCompletions(**kw)
++    return SimpleNamespace(chat=SimpleNamespace(completions=comp)), comp
++
++
++def test_openai_classifier_request_and_parse():
++    client, comp = _fake_client(content='{"intent": "INTERMISSION"}')
++    clf = OpenAIClassifier(client=client, model="gpt-4o-mini")
++    assert asyncio.run(clf.classify("15분간 인터미션")) == "INTERMISSION"
++    assert comp.kwargs["temperature"] == 0
++    assert comp.kwargs["response_format"] == {"type": "json_object"}
++    assert comp.kwargs["model"] == "gpt-4o-mini"
++
++
++def test_openai_classifier_failure_is_none():
++    client, _ = _fake_client(exc=TimeoutError("slow"))
++    assert asyncio.run(OpenAIClassifier(client=client).classify("화재")) == "NONE"
++
++
++def test_keyword_classifier_priority():
++    clf = KeywordClassifier()
++    assert asyncio.run(clf.classify("정전으로 공연을 잠시 중단합니다")) == "POWER_OUT"
++    assert asyncio.run(clf.classify("안녕하세요")) == "NONE"
++
++
++# ── CLOVA 응답 파싱 ─────────────────────────────────────────────────
++def test_clova_config_and_parse():
++    cfg = build_config()
++    assert cfg["transcription"]["language"] == "ko"
++    assert cfg["semanticEpd"]["gapThreshold"] > 0
++    ok = json.dumps({"responseType": ["transcription"], "transcription": {"text": "화재가 발생했습니다"}})
++    assert parse_response(ok) == ("화재가 발생했습니다", True)
++    assert parse_response(json.dumps({"responseType": "transcription", "transcription": {"text": "  "}})) is None
++    assert parse_response(json.dumps({"responseType": ["config"], "config": {"status": "Success"}})) is None
++    assert parse_response("not json") is None
++
++
++# ── 파이프라인 ──────────────────────────────────────────────────────
++class _ScriptedClassifier:
++    def __init__(self, mapping):
++        self.mapping, self.calls = mapping, []
++
++    async def classify(self, text):
++        self.calls.append(text)
++        for k, v in self.mapping.items():
++            if k in text:
++                return v
++        return "NONE"
++
++
++def _make_pipeline(lines, mapping, now):
++    sent = []
++
++    async def send(msg):
++        sent.append(msg)
++
++    stt = MockSTTSession(on_transcript=None, every_sec=1, lines=lines)
++    clf = _ScriptedClassifier(mapping)
++    p = OperatorPipeline(send=send, session_id="t", stt=stt, classifier=clf,
++                         template_lookup=lambda i: [{"template_code": f"{i}_X", "intent_type": i}],
++                         clock=lambda: now[0])
++    return p, sent, clf
++
++
++def test_pipeline_transcript_then_suggestion():
++    async def go():
++        now = [0.0]
++        p, sent, _ = _make_pipeline(["화재가 발생했습니다"], {"화재": "FIRE"}, now)
++        await p.start()
++        await p.feed_audio(b"\x00" * config.BYTES_PER_SEC)  # 1초 → 문장 1개
++        await p.drain()
++        await p.close()
++        return sent
++
++    sent = asyncio.run(go())
++    assert [m["type"] for m in sent] == ["transcript", "suggestion"]
++    assert sent[0] == {**sent[0], "text": "화재가 발생했습니다", "is_final": True}
++    s = sent[1]
++    assert s["intent_type"] == "FIRE" and s["templates"][0]["template_code"] == "FIRE_X"
++    assert "화재" in s["stt_text"]
++
++
++def test_pipeline_none_no_suggestion_and_cooldown():
++    async def go():
++        now = [0.0]
++        p, sent, _ = _make_pipeline(["불이야 도망쳐", "촬영 금지", "촬영 금지", "촬영 금지"],
++                                    {"촬영": "ETIQUETTE"}, now)
++        await p.start()
++        for t in (0, 1, 2, 40):  # 1초 오디오마다 문장 하나
++            now[0] = t
++            await p.feed_audio(b"\x00" * config.BYTES_PER_SEC)
++            await p.drain()
++        await p.close()
++        return sent
++
++    sent = asyncio.run(go())
++    sugg = [m for m in sent if m["type"] == "suggestion"]
++    # "불이야 도망쳐"(NONE) → 추천 없음 / 촬영 금지 t=1 추천, t=2 쿨다운으로 생략, t=40 다시 추천
++    assert len([m for m in sent if m["type"] == "transcript"]) == 4
++    assert len(sugg) == 2 and all(m["intent_type"] == "ETIQUETTE" for m in sugg)
++
++
++def test_pipeline_buffer_joins_fragments():
++    async def go():
++        now = [0.0]
++        p, sent, clf = _make_pipeline(["화재가 발생했", "비상구로 대피"], {"화재가 발생했 비상구로": "FIRE"}, now)
++        await p.start()
++        await p.feed_audio(b"\x00" * config.BYTES_PER_SEC)
++        await p.drain()
++        now[0] = 3
++        await p.feed_audio(b"\x00" * config.BYTES_PER_SEC)
++        await p.drain()
++        await p.close()
++        return sent, clf
++
++    sent, clf = asyncio.run(go())
++    assert clf.calls[-1] == "화재가 발생했 비상구로 대피"
++    assert any(m["type"] == "suggestion" for m in sent)
+diff --git a/tests/test_clova_grpc.py b/tests/test_clova_grpc.py
+new file mode 100644
+index 0000000..ac1579e
+--- /dev/null
++++ b/tests/test_clova_grpc.py
+@@ -0,0 +1,75 @@
++"""
++CLOVA gRPC 클라이언트를 로컬 가짜 서버로 검증 (실제 키 불필요).
++- 첫 메시지가 CONFIG(JSON) 인지
++- 오디오가 DATA 로 그대로 가는지
++- 종료 시 epFlag=true 를 보내는지
++- 응답 JSON 이 transcript 콜백으로 오는지
++
++    pytest -q tests/test_clova_grpc.py
++"""
++import asyncio
++import json
++
++import grpc
++
++from app.ai.stt.clova import ClovaStreamSession
++from app.ai.stt.proto import nest_pb2, nest_pb2_grpc
++
++
++class FakeNest(nest_pb2_grpc.NestServiceServicer):
++    def __init__(self):
++        self.requests = []
++        self.metadata = None
++
++    async def recognize(self, request_iterator, context):
++        self.metadata = dict(context.invocation_metadata())
++        audio = 0
++        async for req in request_iterator:
++            self.requests.append(req)
++            if req.type == nest_pb2.RequestType.DATA:
++                audio += len(req.data.chunk)
++                extra = json.loads(req.data.extra_contents)
++                if audio >= 3200 and not getattr(self, "_sent", False):
++                    self._sent = True
++                    yield nest_pb2.NestResponse(contents=json.dumps(
++                        {"responseType": ["transcription"], "transcription": {"text": "화재가 발생했습니다"}},
++                        ensure_ascii=False))
++                if extra.get("epFlag"):
++                    yield nest_pb2.NestResponse(contents=json.dumps(
++                        {"responseType": ["transcription"], "transcription": {"text": "대피해 주십시오"}},
++                        ensure_ascii=False))
++                    return
++
++
++def test_clova_stream_against_fake_server():
++    async def go():
++        server = grpc.aio.server()
++        fake = FakeNest()
++        nest_pb2_grpc.add_NestServiceServicer_to_server(fake, server)
++        port = server.add_insecure_port("127.0.0.1:0")
++        await server.start()
++
++        got = []
++
++        async def on_t(text, final):
++            got.append((text, final))
++
++        s = ClovaStreamSession(on_t, secret_key="TEST", host=f"127.0.0.1:{port}", secure=False)
++        await s.start()
++        for _ in range(3):
++            await s.feed(b"\x01\x00" * 800)  # 50ms 프레임
++        await asyncio.sleep(0.3)
++        await s.close()
++        await server.stop(None)
++        return fake, got
++
++    fake, got = asyncio.run(go())
++    first = fake.requests[0]
++    assert first.type == nest_pb2.RequestType.CONFIG
++    cfg = json.loads(first.config.config)
++    assert cfg["transcription"]["language"] == "ko"
++    data = [r for r in fake.requests if r.type == nest_pb2.RequestType.DATA]
++    assert sum(len(r.data.chunk) for r in data) == 4800
++    assert json.loads(data[-1].data.extra_contents)["epFlag"] is True
++    assert fake.metadata["authorization"] == "Bearer TEST"
++    assert got == [("화재가 발생했습니다", True), ("대피해 주십시오", True)]
+diff --git a/tests/test_operator_ws.py b/tests/test_operator_ws.py
+new file mode 100644
+index 0000000..d31500f
+--- /dev/null
++++ b/tests/test_operator_ws.py
+@@ -0,0 +1,76 @@
++"""
++오퍼레이터 WebSocket 통합 테스트 (mock STT + 키워드 분류기, 외부 API 없음)
++
++    pytest -q tests/test_operator_ws.py
++"""
++import pytest
++from fastapi.testclient import TestClient
++
++from app.ai import config
++
++
++@pytest.fixture()
++def client(monkeypatch):
++    monkeypatch.setattr(config, "STT_PROVIDER", "mock")
++    monkeypatch.setattr(config, "LLM_PROVIDER", "mock")
++    monkeypatch.setattr(config, "MOCK_STT_EVERY_SEC", 1)
++    monkeypatch.setattr(config, "DEBUG_SAVE_AUDIO", False)
++    from app.main import app
++
++    with TestClient(app) as c:
++        yield c
++
++
++def test_connects_without_auth(client):
++    """11/10 회의: 로그인 제외 → 토큰 없이 바로 연결"""
++    with client.websocket_connect("/api/ws/operator") as ws:
++        assert ws.receive_json()["type"] == "connected"
++
++
++def test_connected_ping_pong_and_errors(client):
++    with client.websocket_connect("/api/ws/operator") as ws:
++        hello = ws.receive_json()
++        assert hello["type"] == "connected"
++        assert hello["audio"] == {"format": "pcm_s16le", "sample_rate": 16000, "channels": 1}
++        assert hello["stt_provider"] == "mock"
++
++        ws.send_json({"type": "ping"})
++        assert ws.receive_json() == {"type": "pong"}
++
++        ws.send_json({"type": "hello"})
++        assert ws.receive_json()["code"] == "UNKNOWN_TYPE"
++
++        ws.send_bytes(b"\x00\x00\x00")  # 홀수 길이
++        assert ws.receive_json()["code"] == "BAD_AUDIO"
++
++
++def test_audio_to_transcript_and_suggestion(client):
++    """mock STT 문장 순서: 안내 → 촬영 금지(추천) → 인터미션(추천) → 공연 대사(NONE) → 화재(추천)"""
++    with client.websocket_connect("/api/ws/operator") as ws:
++        assert ws.receive_json()["type"] == "connected"
++        one_sec = b"\x00" * config.BYTES_PER_SEC
++        got = []
++        for _ in range(5):
++            # 100ms 프레임 10개 = 1초 → 문장 1개
++            for _ in range(10):
++                ws.send_bytes(one_sec[: config.BYTES_PER_SEC // 10])
++            got.append(ws.receive_json())  # transcript
++            if got[-1]["text"] != "공연 시작 전 안내 말씀드립니다" and "불이야" not in got[-1]["text"]:
++                got.append(ws.receive_json())  # suggestion
++
++        types = [m["type"] for m in got]
++        assert types.count("transcript") == 5
++        sugg = [m for m in got if m["type"] == "suggestion"]
++        assert [m["intent_type"] for m in sugg] == ["ETIQUETTE", "INTERMISSION", "FIRE"]
++        fire = sugg[-1]
++        assert {t["template_code"] for t in fire["templates"]} == {"FIRE_EVAC"}
++        etq = sugg[0]
++        assert {t["template_code"] for t in etq["templates"]} >= {"ETIQUETTE_PHOTO", "ETIQUETTE_FOOD"}
++
++
++def test_sse_still_works_after_split(client):
++    """A 의 관객 SSE 경로가 그대로 등록돼 있는지 (WebSocket 분리 영향 없음)"""
++    schema = client.get("/openapi.json").json()
++    assert "/api/stream/notices" in schema["paths"]
++    with client.websocket_connect("/api/ws/operator") as ws:
++        assert ws.receive_json()["type"] == "connected"

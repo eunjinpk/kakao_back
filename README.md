@@ -61,20 +61,26 @@ es.addEventListener('heartbeat', () => { /* 연결 살아있음 */ });
 보내고, 서버가 그 뒤 이벤트를 전부 다시 보냅니다. 거기에 더해, 탭이 다시 활성화되거나
 네트워크가 복구될 때 `GET /api/notices/active` 를 한 번 호출해 화면을 맞추면 확실합니다.
 
-### 3. 오퍼레이터 화면 — WebSocket (추천 받기 + 오디오 올리기)
+### 3. 오퍼레이터 화면 — WebSocket (오디오 올리기 + 자막·추천 받기)
 
 ```js
+// 인증 없음 (11/10 회의: 로그인 제외)
 const ws = new WebSocket('ws://localhost:8000/api/ws/operator');
+ws.binaryType = 'arraybuffer';
 ws.onmessage = (e) => {
   const msg = JSON.parse(e.data);
-  if (msg.event === 'suggestion') {
-    // msg.data.intent_type, msg.data.templates[]  → 추천 팝업
-    // 오퍼레이터가 하나 골라 POST /api/notices 호출
+  switch (msg.type) {
+    case 'connected':  /* 오디오 전송 시작 */ break;
+    case 'transcript': /* msg.text, msg.is_final → 실시간 자막 */ break;
+    case 'suggestion': /* msg.intent_type, msg.templates[] → 추천 팝업, 하나 골라 POST /api/notices */ break;
+    case 'error':      /* msg.code, msg.message */ break;
   }
 };
+// 오디오: 16kHz mono PCM16 바이너리 (static/pcm-worklet.js 사용)
 ```
 
-더미 서버는 **15초마다 가짜 추천**을 보냅니다. 추천 팝업 UI 를 만들어 보세요.
+자세한 이벤트 명세: **[docs/WS_OPERATOR.md](docs/WS_OPERATOR.md)** · 마이크 테스트: `http://localhost:8000/static/mic_test.html`
+`.env` 의 `STT_PROVIDER=mock` 이면 키 없이도 샘플 자막과 추천이 옵니다.
 
 ---
 
@@ -89,7 +95,7 @@ ws.onmessage = (e) => {
 | POST | `/api/notices` | 공지 승인·송출 |
 | PATCH | `/api/notices/{id}` | 정정 |
 | POST | `/api/notices/{id}/end` | 종료 |
-| WS | `/api/ws/operator` | 오디오 업로드 + 추천 수신 |
+| WS | `/api/ws/operator` | 오디오 업로드 + 자막·추천 수신 ([명세](docs/WS_OPERATOR.md)) |
 
 ### 관객 (인증 없음)
 
@@ -193,8 +199,10 @@ app/
 └── routers/
     ├── auth.py          로그인 (W1 후반 bcrypt + JWT 로 교체)
     ├── notices.py       송출 / 정정 / 종료 / 조회
-    └── stream.py        SSE + WebSocket
+    ├── stream.py        관객 SSE
+    └── operator.py      오퍼레이터 WebSocket (개발자 B)
 
+app/ai/                  AI 파이프라인 (개발자 B) → docs/AI_PIPELINE.md
 data/templates.json      템플릿 문구 (개발자 B 관리)
 ```
 

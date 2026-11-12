@@ -1,0 +1,41 @@
+// CLOVA Speech 실시간 스트리밍 API 인터페이스
+//
+// ⚠️ 공식 문서의 nest.proto 와 반드시 대조할 것
+//    https://api.ncloud-docs.com/docs/ai-application-service-clovaspeech-grpc
+//    필드 번호가 다르면 서버가 요청을 해석하지 못한다.
+//    다르면 이 파일을 공식 파일로 덮어쓰고 scripts/gen_proto.sh 를 다시 실행한다.
+syntax = "proto3";
+
+option java_multiple_files = true;
+
+package com.nbp.cdncp.nest.grpc.proto.v1;
+
+enum RequestType {
+  CONFIG = 0;
+  DATA = 1;
+}
+
+message NestConfig {
+  string config = 1;
+}
+
+message NestData {
+  bytes chunk = 1;
+  string extra_contents = 2;
+}
+
+message NestRequest {
+  RequestType type = 1;
+  oneof part {
+    NestConfig config = 2;
+    NestData data = 3;
+  }
+}
+
+message NestResponse {
+  string contents = 1;
+}
+
+service NestService {
+  rpc recognize(stream NestRequest) returns (stream NestResponse) {};
+}
