@@ -1,13 +1,12 @@
 """
-관객 SSE + 오퍼레이터 WebSocket.
+관객 SSE. 관객은 받기만 한다.
 
-관객: 받기만 한다 (SSE)
-오퍼레이터: 오디오를 올리고 추천을 받는다 (WebSocket)
+오퍼레이터 WebSocket 은 app/routers/operator.py (개발자 B).
 """
 import asyncio
 import json
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request
 from sse_starlette.sse import EventSourceResponse
 
 from app import hub, store
@@ -61,43 +60,4 @@ async def stream_notices(request: Request):
     return EventSourceResponse(gen())
 
 
-@router.websocket("/ws/operator")
-async def operator_socket(ws: WebSocket):
-    """
-    오퍼레이터 PC 연결.
-
-    - 올라오는 것: 마이크 오디오 조각 (더미에서는 무시. 저장하지 않음)
-    - 내려가는 것: AI 추천 (개발자 B가 채울 자리. 지금은 가짜 추천)
-
-    더미에서는 15초마다 ETIQUETTE 추천을 한 번씩 보내서
-    프론트가 추천 팝업 UI 를 만들 수 있게 한다.
-    """
-    await ws.accept()
-    hub.add_operator(ws)
-
-    async def fake_suggestions():
-        samples = ["ETIQUETTE", "DELAY", "INTERMISSION"]
-        i = 0
-        while True:
-            await asyncio.sleep(15)
-            intent = samples[i % len(samples)]
-            i += 1
-            await hub.send_suggestion({
-                "event": "suggestion",
-                "data": {
-                    "intent_type": intent,
-                    "stt_text": "(더미) 현장 음성에서 인식된 문장입니다",
-                    "templates": store.templates_for_intent(intent),
-                },
-            })
-
-    task = asyncio.create_task(fake_suggestions())
-    try:
-        while True:
-            # 오디오는 받기만 하고 버린다 (공연 녹음 금지)
-            await ws.receive()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        task.cancel()
-        hub.remove_operator(ws)
+# 오퍼레이터 WebSocket 은 app/routers/operator.py 로 이동 (개발자 B 담당)

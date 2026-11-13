@@ -8,3 +8,13 @@ sqlalchemy
 bcrypt
 python-jose[cryptography]
 python-dotenv
+
+# 음성 트랙 (개발자 B)
+openai>=1.40
+grpcio>=1.85.1          # app/ai/stt/proto/*_pb2_grpc.py 생성 버전과 맞춤
+grpcio-tools>=1.85.1    # proto 재생성용 (scripts/gen_proto.sh)
+protobuf>=7.35.1         # nest_pb2.py 생성 버전과 맞춤
+
+# 테스트
+pytest
+httpx

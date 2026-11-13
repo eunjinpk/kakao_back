@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>세이프큐 · 오퍼레이터 마이크 테스트 (개발용)</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Apple SD Gothic Neo", sans-serif; max-width: 860px; margin: 24px auto; padding: 0 16px; color: #1f2328; }
+  h1 { font-size: 20px; }
+  fieldset { border: 1px solid #d0d7de; border-radius: 8px; margin-bottom: 16px; }
+  input, button { font-size: 14px; padding: 6px 10px; margin: 4px 4px 4px 0; }
+  button { cursor: pointer; }
+  #status { font-weight: 600; }
+  #level { width: 200px; height: 10px; background: #eaeef2; display: inline-block; vertical-align: middle; border-radius: 5px; overflow: hidden; }
+  #level > div { height: 100%; width: 0; background: #2da44e; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .box { border: 1px solid #d0d7de; border-radius: 8px; padding: 8px 12px; height: 340px; overflow-y: auto; font-size: 14px; }
+  .partial { color: #8c959f; }
+  .sug { border-left: 4px solid #cf222e; padding: 6px 8px; margin: 8px 0; background: #fff8f8; }
+  .tpl { margin: 4px 0 4px 8px; }
+  .err { color: #cf222e; }
+  small { color: #57606a; }
+</style>
+</head>
+<body>
+<h1>오퍼레이터 마이크 테스트 <small>(개발용 · 오디오는 저장되지 않음)</small></h1>
+
+<fieldset>
+  <legend>연결 · 마이크</legend>
+  <button id="btnConnect">WebSocket 연결</button>
+  <button id="btnMic" disabled>마이크 시작</button>
+  <button id="btnStop" disabled>정지</button>
+  <span id="status">대기</span> &nbsp; 입력 <span id="level"><div></div></span>
+  <div><small>16kHz · mono · PCM16 · 100ms 프레임 · 전송 <span id="sent">0</span> KB</small></div>
+</fieldset>
+
+<div class="cols">
+  <div><b>transcript</b><div id="transcripts" class="box"></div></div>
+  <div><b>suggestion / error</b><div id="events" class="box"></div></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const API = location.origin;              // 같은 서버에서 열면 그대로 동작
+let ws = null, ctx = null, stream = null, node = null, sentBytes = 0, pingTimer = null;
+
+$("btnConnect").onclick = () => {
+  const url = `${API.replace(/^http/, "ws")}/api/ws/operator`;
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    setStatus("연결됨");
+    pingTimer = setInterval(() => ws.readyState === 1 && ws.send(JSON.stringify({ type: "ping" })), 20000);
+  };
+  ws.onclose = (e) => { setStatus(`연결 종료 (${e.code})`); clearInterval(pingTimer); stopMic(); $("btnMic").disabled = true; };
+  ws.onmessage = (e) => handle(JSON.parse(e.data));
+};
+
+function handle(msg) {
+  switch (msg.type) {
+    case "connected":
+      setStatus(`연결됨 · STT=${msg.stt_provider}`);
+      $("btnMic").disabled = false;
+      break;
+    case "transcript": {
+      const box = $("transcripts");
+      const last = box.lastElementChild;
+      if (last && last.classList.contains("partial")) last.remove();  // 중간 결과는 덮어쓰기
+      const p = document.createElement("div");
+      p.textContent = msg.text;
+      if (!msg.is_final) p.classList.add("partial");
+      box.appendChild(p); box.scrollTop = box.scrollHeight;
+      break;
+    }
+    case "suggestion": {
+      const d = document.createElement("div");
+      d.className = "sug";
+      d.innerHTML = `<b>추천: ${msg.intent_type}</b><br><small>${escapeHtml(msg.stt_text)}</small>`;
+      for (const t of msg.templates) {
+        const row = document.createElement("div");
+        row.className = "tpl";
+        row.textContent = `· [${t.template_code}] ${t.text_ko} / ${t.text_zh}`;
+        d.appendChild(row);
+      }
+      $("events").appendChild(d); $("events").scrollTop = $("events").scrollHeight;
+      break;
+    }
+    case "error": {
+      const d = document.createElement("div");
+      d.className = "err"; d.textContent = `error ${msg.code}: ${msg.message}`;
+      $("events").appendChild(d);
+      break;
+    }
+  }
+}
+
+$("btnMic").onclick = async () => {
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true },
+  });
+  ctx = new AudioContext();                      // 기본 샘플레이트로 열고 worklet 에서 16kHz 로 변환
+  await ctx.audioWorklet.addModule("pcm-worklet.js");
+  const src = ctx.createMediaStreamSource(stream);
+  node = new AudioWorkletNode(ctx, "pcm-worklet");
+  node.port.onmessage = (e) => {
+    if (ws && ws.readyState === 1) {
+      ws.send(e.data);                           // ArrayBuffer (Int16 PCM)
+      sentBytes += e.data.byteLength;
+      $("sent").textContent = (sentBytes / 1024).toFixed(0);
+      showLevel(new Int16Array(e.data));
+    }
+  };
+  src.connect(node);
+  setStatus(`녹음 중 (입력 ${ctx.sampleRate}Hz → 16000Hz)`);
+  $("btnMic").disabled = true; $("btnStop").disabled = false;
+};
+
+$("btnStop").onclick = () => { stopMic(); $("btnMic").disabled = !(ws && ws.readyState === 1); };
+
+function stopMic() {
+  if (node) node.disconnect();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  if (ctx) ctx.close();
+  node = stream = ctx = null;
+  $("btnStop").disabled = true;
+  $("level").firstElementChild.style.width = "0";
+}
+
+function showLevel(pcm) {
+  let peak = 0;
+  for (let i = 0; i < pcm.length; i += 8) peak = Math.max(peak, Math.abs(pcm[i]));
+  $("level").firstElementChild.style.width = `${Math.min(100, (peak / 32768) * 160)}%`;
+}
+function setStatus(s) { $("status").textContent = s; }
+function escapeHtml(s) { return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+</script>
+</body>
+</html>
