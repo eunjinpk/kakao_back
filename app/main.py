@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app import hub, store
-from app.routers import auth, notices, operator, stream
+from app.routers import notices, operator, stream
 
 app = FastAPI(
     title="세이프큐 백엔드 (더미)",
@@ -63,7 +63,6 @@ def intents():
     }
 
 
-app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(notices.router, prefix="/api", tags=["notices"])
 app.include_router(stream.router, prefix="/api", tags=["stream"])
 app.include_router(operator.router, prefix="/api", tags=["operator"])

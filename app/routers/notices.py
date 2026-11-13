@@ -3,12 +3,13 @@
 
 생성 경로가 템플릿이든 자유 입력이든 AI 추천을 승인한 것이든,
 만들어지는 레코드와 그 뒤 흐름은 완전히 같다.
+
+11/10 회의 결정으로 로그인은 없다. 오퍼레이터 API 도 인증 없이 열려 있다.
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app import hub, store
-from app.routers.auth import require_operator
 
 router = APIRouter()
 
@@ -40,7 +41,7 @@ def _publish(action: str, notice: dict, operator_id: int | None):
 
 
 @router.get("/templates")
-def get_templates(user=Depends(require_operator)):
+def get_templates():
     """오퍼레이터 버튼용 템플릿 목록. intent 별로 묶어서도 함께 준다."""
     items = store.list_templates()
     by_intent: dict[str, list] = {}
@@ -50,7 +51,7 @@ def get_templates(user=Depends(require_operator)):
 
 
 @router.post("/notices", status_code=201)
-def create_notice(body: NoticeCreate, user=Depends(require_operator)):
+def create_notice(body: NoticeCreate):
     if body.intent_type not in store.TEMPLATE_INTENTS:
         raise HTTPException(400, f"invalid_intent_type:{body.intent_type}")
 
@@ -72,13 +73,13 @@ def create_notice(body: NoticeCreate, user=Depends(require_operator)):
     if not payload.get("text_ko"):
         raise HTTPException(400, "text_ko_required")
 
-    notice = store.create_notice(payload, user["id"])
-    event = _publish("CREATED", notice, user["id"])
+    notice = store.create_notice(payload, None)
+    event = _publish("CREATED", notice, None)
     return {"notice": notice, "event_id": event["event_id"]}
 
 
 @router.patch("/notices/{notice_id}")
-def correct_notice(notice_id: int, body: NoticePatch, user=Depends(require_operator)):
+def correct_notice(notice_id: int, body: NoticePatch):
     notice = store.get_notice(notice_id)
     if not notice:
         raise HTTPException(404, "notice_not_found")
@@ -86,12 +87,12 @@ def correct_notice(notice_id: int, body: NoticePatch, user=Depends(require_opera
         raise HTTPException(409, f"cannot_correct_from:{notice['status']}")
 
     store.correct_notice(notice, body.model_dump(exclude_none=True))
-    event = _publish("CORRECTED", notice, user["id"])
+    event = _publish("CORRECTED", notice, None)
     return {"notice": notice, "event_id": event["event_id"]}
 
 
 @router.post("/notices/{notice_id}/end")
-def end_notice(notice_id: int, user=Depends(require_operator)):
+def end_notice(notice_id: int):
     notice = store.get_notice(notice_id)
     if not notice:
         raise HTTPException(404, "notice_not_found")
@@ -99,7 +100,7 @@ def end_notice(notice_id: int, user=Depends(require_operator)):
         raise HTTPException(409, f"cannot_end_from:{notice['status']}")
 
     store.end_notice(notice)
-    event = _publish("ENDED", notice, user["id"])
+    event = _publish("ENDED", notice, None)
     return {"notice": notice, "event_id": event["event_id"]}
 
 
