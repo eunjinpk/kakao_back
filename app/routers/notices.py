@@ -1,129 +1,130 @@
 """
-공지 — 송출 / 정정 / 종료 / 조회.
+공지 송출·정정·종료.
 
-생성 경로가 템플릿이든 자유 입력이든 AI 추천을 승인한 것이든,
-만들어지는 레코드와 그 뒤 흐름은 완전히 같다.
+한 번에 한 건만 보인다 (OP-03-9). 송출 중인 공지가 있으면 409 를 돌려주고,
+프론트가 확인 팝업을 띄운 뒤 replace_active=true 로 다시 보낸다.
 
-11/10 회의 결정으로 로그인은 없다. 오퍼레이터 API 도 인증 없이 열려 있다.
+화재는 예외가 둘이다.
+  - 화재가 들어오면 확인 없이 기존 공지를 끊고 나간다.
+  - 화재가 떠 있는 동안에는 어떤 공지도 밀어낼 수 없다. [종료]로만 내린다.
+    (대피 안내 위에 "휴대폰 꺼주세요" 가 덮이면 안 되므로)
+
+라우터가 전부 async def 인 이유: 공지를 바꾸면 관객 SSE 큐에 밀어넣는데,
+그 큐는 이벤트 루프 안에서 건드려야 안전하다.
 """
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from app import hub, store
+from app import store
+from app.db import get_db
 
 router = APIRouter()
 
 
-class NoticeCreate(BaseModel):
-    intent_type: str
-    template_code: str | None = None
-    pictogram_code: str | None = None
-    text_ko: str = ""
-    text_zh: str = ""
-    text_en: str = ""
-    direction: str | None = None      # LEFT | RIGHT | FRONT | REAR
-    duration_min: int | None = None   # 타이머가 필요한 공지
+class NoticeIn(BaseModel):
+    intent_type: str = Field(..., examples=["DELAY"])
+    template_code: str | None = Field(None, examples=["SHOW_DELAY"])
+
+    # 직접 작성할 때만 채운다. 템플릿을 쓰면 템플릿 문구가 들어간다.
+    text_ko: str | None = None
+    text_en: str | None = None
+    text_zh: str | None = None
+    text_ja: str | None = None
+
+    minutes: int | None = Field(None, examples=[10])
+    pictogram: str | None = None
+    widget: str | None = Field(None, description="none | timer | map")
+    direction: str | None = Field(None, description="LEFT | RIGHT | FRONT | REAR (선택)")
+
+    # 직접 작성한 공지는 오퍼레이터가 일반/비상을 고른다 (11/15 회의).
+    trigger_haptic: bool | None = None
+    operator_name: str | None = None
+
+    # 송출 중인 공지를 끊고 내보낼지. 프론트가 확인 팝업 뒤에 true 로 다시 보낸다.
+    replace_active: bool = False
 
 
 class NoticePatch(BaseModel):
+    intent_type: str | None = None
+    template_code: str | None = None
     text_ko: str | None = None
-    text_zh: str | None = None
     text_en: str | None = None
+    text_zh: str | None = None
+    text_ja: str | None = None
+    minutes: int | None = None
+    pictogram: str | None = None
+    widget: str | None = None
     direction: str | None = None
-    pictogram_code: str | None = None
-    duration_min: int | None = None
+    trigger_haptic: bool | None = None
+    operator_name: str | None = None
 
 
-def _publish(action: str, notice: dict, operator_id: int | None):
-    event = store.append_event(action, notice, operator_id)
-    hub.broadcast(event["event_id"], store.to_sse_payload(event))
-    return event
-
-
-@router.get("/templates")
-def get_templates():
-    """오퍼레이터 버튼용 템플릿 목록. intent 별로 묶어서도 함께 준다."""
-    items = store.list_templates()
-    by_intent: dict[str, list] = {}
-    for t in items:
-        by_intent.setdefault(t["intent_type"], []).append(t)
-    return {"templates": items, "by_intent": by_intent}
+def _fail(e: store.StoreError):
+    status = 404 if e.code == "not_found" else 400
+    raise HTTPException(status_code=status,
+                        detail={"code": e.code, "message": e.message, **e.extra})
 
 
 @router.post("/notices", status_code=201)
-def create_notice(body: NoticeCreate):
-    if body.intent_type not in store.TEMPLATE_INTENTS:
-        raise HTTPException(400, f"invalid_intent_type:{body.intent_type}")
+async def post_notice(body: NoticeIn, db: Session = Depends(get_db)):
+    active = store.get_active_notice(db)
 
-    payload = body.model_dump()
+    if active:
+        if active.intent_type == "FIRE":
+            raise HTTPException(409, detail={
+                "code": "fire_active",
+                "message": "화재 대피 안내가 송출 중입니다. [종료] 후에 보낼 수 있습니다.",
+                "active_notice_id": active.id,
+            })
+        if body.intent_type != "FIRE" and not body.replace_active:
+            raise HTTPException(409, detail={
+                "code": "active_exists",
+                "message": "이미 송출 중인 공지가 있습니다. 바꾸시겠습니까?",
+                "active_notice_id": active.id,
+                "active_text_ko": active.text_ko,
+            })
 
-    # 템플릿을 골랐으면 비어 있는 칸을 템플릿 값으로 채운다
-    if body.template_code:
-        tpl = store.get_template(body.template_code)
-        if not tpl:
-            raise HTTPException(400, f"unknown_template:{body.template_code}")
-        for key in ("pictogram_code", "text_ko", "text_zh", "text_en"):
-            if not payload.get(key):
-                payload[key] = tpl.get(key)
-        if tpl.get("needs_direction") and not payload.get("direction"):
-            raise HTTPException(400, "direction_required")
-        if tpl.get("needs_duration") and not payload.get("duration_min"):
-            raise HTTPException(400, "duration_required")
-
-    if not payload.get("text_ko"):
-        raise HTTPException(400, "text_ko_required")
-
-    notice = store.create_notice(payload, None)
-    event = _publish("CREATED", notice, None)
-    return {"notice": notice, "event_id": event["event_id"]}
+    try:
+        data = body.model_dump(exclude_unset=True)
+        data.pop("replace_active", None)
+        return store.create_notice(db, data)
+    except store.StoreError as e:
+        _fail(e)
 
 
 @router.patch("/notices/{notice_id}")
-def correct_notice(notice_id: int, body: NoticePatch):
-    notice = store.get_notice(notice_id)
-    if not notice:
-        raise HTTPException(404, "notice_not_found")
-    if notice["status"] != "ACTIVE":
-        raise HTTPException(409, f"cannot_correct_from:{notice['status']}")
-
-    store.correct_notice(notice, body.model_dump(exclude_none=True))
-    event = _publish("CORRECTED", notice, None)
-    return {"notice": notice, "event_id": event["event_id"]}
+async def patch_notice(notice_id: int, body: NoticePatch, db: Session = Depends(get_db)):
+    """정정 (OP-04). 템플릿과 상황까지 바꿀 수 있다."""
+    try:
+        return store.correct_notice(db, notice_id, body.model_dump(exclude_unset=True))
+    except store.StoreError as e:
+        _fail(e)
 
 
 @router.post("/notices/{notice_id}/end")
-def end_notice(notice_id: int):
-    notice = store.get_notice(notice_id)
-    if not notice:
-        raise HTTPException(404, "notice_not_found")
-    if notice["status"] != "ACTIVE":
-        raise HTTPException(409, f"cannot_end_from:{notice['status']}")
-
-    store.end_notice(notice)
-    event = _publish("ENDED", notice, None)
-    return {"notice": notice, "event_id": event["event_id"]}
+async def end_notice(notice_id: int, db: Session = Depends(get_db)):
+    try:
+        return store.end_notice(db, notice_id)
+    except store.StoreError as e:
+        _fail(e)
 
 
 @router.get("/notices/active")
-def list_active():
+def get_active(db: Session = Depends(get_db)):
     """
-    인증 없음. 관객이 늦게 접속했거나 네트워크가 끊겼다 붙었을 때
-    현재 화면을 맞추는 용도.
+    관객 기기가 처음 붙었을 때 부른다. 지금 떠 있어야 할 공지를 알려준다.
+    없으면 notice 가 null.
     """
-    return {
-        "notices": [
-            {
-                "notice_id": n["notice_id"],
-                "intent_type": n["intent_type"],
-                "pictogram_code": n["pictogram_code"],
-                "text_ko": n["text_ko"],
-                "text_zh": n["text_zh"],
-                "text_en": n["text_en"],
-                "trigger_haptic": n["trigger_haptic"],
-                "direction": n["direction"],
-                "expires_at": n["expires_at"],
-                "revision": n["revision"],
-            }
-            for n in store.active_notices()
-        ]
-    }
+    n = store.get_active_notice(db)
+    return {"notice": store._notice_dict(n) if n else None}
+
+
+@router.get("/notices/past")
+def get_past(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+):
+    """지난 공지 (AU-06)."""
+    return {"notices": store.list_past_notices(db, limit, offset)}

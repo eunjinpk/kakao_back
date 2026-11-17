@@ -1,8 +1,7 @@
 """
-세이프큐 백엔드 — W1 더미 서버
+세이프큐 백엔드
 
-DB 없이 메모리로 돌아간다. 프론트가 바로 붙을 수 있게 하는 것이 목적.
-W1 후반에 저장소만 SQLAlchemy 로 바꾸면 프론트는 수정 불필요.
+공지·템플릿은 SQLite(safeq.db)에 저장된다. 서버를 꺼도 남는다.
 
 실행:
     uvicorn app.main:app --reload --port 8000
@@ -16,15 +15,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app import hub, store
-from app.routers import notices, operator, stream
+from app.routers import notices, operator, stream, templates
 
 app = FastAPI(
-    title="세이프큐 백엔드 (더미)",
-    version="0.0.1-dummy",
+    title="세이프큐 백엔드",
+    version="0.2.0",
     description="공연장 실시간 다국어 비상안내 시스템 · 팀 오롯이닿다",
 )
 
-# W1 은 전체 허용. 배포 전에 프론트 도메인만 남긴다.
+# 개발 중에는 전체 허용. 배포 전에 프론트 도메인만 남긴다.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,17 +35,17 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup():
+    # 테이블을 만들고, 비어 있으면 data/templates.json 을 넣는다.
+    # 이미 들어 있으면 건드리지 않는다 — 화면에서 고친 내용이 날아가면 안 되므로.
     store.load_templates()
-    print(f"\n  템플릿 {len(store.list_templates())}개 로드됨")
-    print("  문서  http://localhost:8000/docs")
-    print("  로그인 operator / test1234\n")
+    print(f"\n  템플릿 {len(store.list_templates())}개")
+    print("  문서  http://localhost:8000/docs\n")
 
 
 @app.get("/api/health")
 def health():
     return {
         "ok": True,
-        "mode": "dummy",
         "templates": len(store.list_templates()),
         "audience_connected": hub.audience_count(),
         "operators_connected": hub.operator_count(),
@@ -60,10 +59,13 @@ def intents():
         "llm_intents": list(store.LLM_INTENTS),
         "template_intents": list(store.TEMPLATE_INTENTS),
         "priority": store.PRIORITY,
+        "widgets": list(store.WIDGETS),
+        "haptic_intents": list(store.HAPTIC_INTENTS),
     }
 
 
 app.include_router(notices.router, prefix="/api", tags=["notices"])
+app.include_router(templates.router, prefix="/api", tags=["templates"])
 app.include_router(stream.router, prefix="/api", tags=["stream"])
 app.include_router(operator.router, prefix="/api", tags=["operator"])
 
