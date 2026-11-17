@@ -12,7 +12,7 @@
 | 11/28 | 프론트 포함 처음부터 끝까지 데모 |
 | 12/3 | 백엔드 v0.1 완료 |
 
-> 표기: ✅ 구현됨 · 🛠 작업 예정 · ❓ 팀 확인 필요
+> 표기: ✅ 구현됨 · 🛠 작업 예정 · ❓ 확정 대기
 
 ---
 
@@ -67,7 +67,7 @@ uvicorn app.main:app --reload --port 8000
 | AI 역할 | **추천만 합니다.** 오퍼레이터 화면에만 템플릿을 띄우고, 오퍼레이터가 [송출]을 눌러야 관객에게 나갑니다 (OP-02, OP-03) |
 | 오경보 방지 | LLM 은 확실하지 않으면 `NONE`. 오류·타임아웃도 `NONE` 처리. 신뢰도(confidence) 판단은 쓰지 않음 |
 | AI 문구 생성 | 쉬운 글 요약·번역도 **오퍼레이터가 확인하고 고친 뒤** 송출 (OP-09, OP-10) |
-| 공지 개수 | **한 번에 1건만 유지**. 새 공지를 보내면 기존 공지는 종료 (OP-03) |
+| 공지 개수 | **한 번에 1건만 유지** (OP-03). **화재 공지는 다른 공지로 밀어낼 수 없고 [종료]로만 내림** |
 | 다국어 | 한국어 쉬운 글(기본) + 영어·중국어·**일본어**. 번역은 LLM 자동 생성 후 오퍼레이터 확인 |
 | 진동·점멸 | **화재(비상)만** (`trigger_haptic=true`). 정정 때 1초 진동 여부는 프론트가 `action` 으로 판단 (AU-01, AU-07) |
 | 통신 | 관객: **SSE** · 오퍼레이터: **WebSocket**(음성·자막·추천) + **REST**(송출·정정·종료·템플릿) |
@@ -111,7 +111,7 @@ flowchart LR
 |---|---|---|---|---|---|
 | OP-01 | 현장 마이크 수음 및 전송 | 1 | `WS /api/ws/operator` 에 16kHz PCM16 바이너리. 수음 OFF 는 프론트가 전송만 멈추면 됨 (30초 오디오 없으면 서버가 CLOVA 연결 정리) | B | ✅ |
 | OP-02 | AI 상황 인지 및 템플릿 추천 | 1 | 6개 상황 분류(일반 안내 제외, 해당 없으면 추천 없음) → `suggestion`(유형, 근거 문장, 시각, 템플릿 **최대 3개**), AI 실패 시 `error: AI_FAILED` | B | ✅ / 🛠 최대 3개·AI_FAILED |
-| OP-03 | 알림 최종 송출 | 1 | `POST /api/notices`. **1건 유지 규칙**(기존 공지 종료 후 송출), 인터미션 시간 입력 | A | ✅ / 🛠 1건 규칙 |
+| OP-03 | 알림 최종 송출 | 1 | `POST /api/notices`. **1건 유지 규칙 + 화재 보호**(6-1 참고), 분 수 입력(`needs_duration`) | A | ✅ / 🛠 1건 규칙 |
 | OP-04 | 송출 공지 정정 및 종료 | 1 | `PATCH /api/notices/{id}`(문구·**템플릿 교체**·남은 시간), `POST .../end`, 이력 기록. 문구 수정 시 번역 재생성은 `POST /api/ai/translate` | A (+B 번역) | ✅ / 🛠 템플릿 교체 |
 | OP-05 | 현재 송출 상태 모니터링 | 2 | `GET /api/notices/active`, 수신 기기 수는 `GET /api/health` 의 `audience_connected` | A | ✅ |
 | OP-06 | 마이크·서버 연결 상태 | 2 | WebSocket `connected` / `ping`·`pong`, 끊기면 프론트가 재연결 | B | ✅ |
@@ -127,7 +127,7 @@ flowchart LR
 |---|---|---|---|---|---|
 | AU-01 | 시각·촉각 강제 오버레이 | 1 | SSE `notice_update`, `trigger_haptic` (화재만 true) | A | ✅ |
 | AU-02 | 표준 픽토그램 | 1 | `pictogram_code` (디자인팀 SVG 파일명과 동일, ❓ 확정 대기) | A·B | ✅ / ❓ 키 |
-| AU-03 | 행동 유도형 위젯 | 1 | `widget`: `timer`(인터미션, `expires_at`) / `map`(대피로 약도 이미지) / `none` | A | ✅ timer / 🛠 map |
+| AU-03 | 행동 유도형 위젯 | 1 | `widget`: `timer`(인터미션만, `expires_at` 카운트다운) / `map`(화재, 대피로 약도 이미지) / `none` | A | ✅ timer / 🛠 map |
 | AU-04 | 공지 자막 언어 선택 | 2 | 공지 한 건에 `text_ko`, `text_en`, `text_zh`, `text_ja` 함께 전송 | A | ✅ / 🛠 `text_ja` |
 | AU-05 | 쉬운 글 자막 | 1 | `text_ko` = 템플릿의 쉬운 글 요약 문구 (모든 공지 공통) | A·B | ✅ |
 | AU-06 | 지난 공지 목록 | 3 | `GET /api/notices/past` (종료된 공지 최신순, 정정 여부) | A | 🛠 |
@@ -175,10 +175,23 @@ flowchart LR
 **템플릿**
 - intent 하나에 템플릿 여러 개 (예: `ETIQUETTE` → 촬영 금지, 취식 금지, 휴대폰 금지)
 - 코드: `LLM_INTENTS`(6개 + `NONE`) / `TEMPLATE_INTENTS`(6개 + `INFO`) → 추천 대상은 겹치는 6개
-- AI 가 intent 를 감지하면 해당 intent 템플릿을 `sort_order` 순으로 **최대 3개** 추천
+- AI 가 intent 를 감지하면 해당 intent 템플릿을 **`sort_order` 순으로 최대 3개** 추천 (명세서의 "적합도 높은 순")
 - 오퍼레이터가 추가·수정한 템플릿(OP-09)은 저장 즉시 추천 후보에도 들어감
 - 초기 데이터: `data/templates.json` (개발자 B 관리) → DB 로 넣음 (개발자 A)
 - B 코드는 템플릿을 `store.templates_for_intent(intent)` 로만 읽음 (동기 함수, dict 목록)
+
+**분 수 입력과 타이머는 따로**
+
+| 필드 | 뜻 | 대상 |
+|---|---|---|
+| `needs_duration` | 송출할 때 분 수를 입력받을지. 본문의 `{minutes}` 가 그 숫자로 바뀜 | 일시 중단, 공연 지연, 인터미션 |
+| `widget: timer` | 관객 화면에 카운트다운을 띄울지 | **인터미션만** |
+
+예: 지연 템플릿 `"공연이 {minutes}분 지연됩니다"` + 10분 입력 → `"공연이 10분 지연됩니다"` (카운트다운 없음)
+
+**sort_order**: 10 단위 (화재 10 / 정전 20 / 일시중단 30 / 공연지연 40 / 인터미션 50 / 관람예절 60 / 일반안내 70). 같은 상황 안에서는 61, 62 … 처럼 끼워 넣음
+
+**is_default**: 기본 템플릿(화재·정전)은 **삭제도 숨기기도 불가**
 
 ---
 
@@ -190,8 +203,8 @@ flowchart LR
 |---|---|---|---|---|---|
 | GET | `/api/templates` | 템플릿 목록 (`templates`, `by_intent`) | OP-08 | A | ✅ |
 | POST | `/api/templates` | 템플릿 추가 | OP-09 | A | 🛠 |
-| PATCH | `/api/templates/{template_code}` | 템플릿 수정 | OP-09 | A | 🛠 |
-| DELETE | `/api/templates/{template_code}` | 템플릿 삭제 (기본 비상 템플릿 불가) | OP-09 | A | 🛠 |
+| PATCH | `/api/templates/{code}` | 템플릿 수정·숨기기 (`is_default` 는 숨기기 불가) | OP-09 | A | 🛠 |
+| DELETE | `/api/templates/{code}` | 템플릿 삭제 (`is_default` 는 삭제 불가) | OP-09 | A | 🛠 |
 | POST | `/api/notices` | 공지 송출 | OP-03, 11 | A | ✅ |
 | PATCH | `/api/notices/{id}` | 공지 정정 (문구, 템플릿 교체, 남은 시간) | OP-04 | A | ✅ / 🛠 템플릿 교체 |
 | POST | `/api/notices/{id}/end` | 상황 종료 | OP-04 | A | ✅ |
@@ -200,19 +213,26 @@ flowchart LR
 
 **공지 송출 예시**
 ```bash
-# 인터미션 15분
+# 인터미션 20분 (본문 {minutes} → 20, 카운트다운 표시)
 curl -X POST localhost:8000/api/notices -H 'Content-Type: application/json' \
-  -d '{"intent_type":"INTERMISSION","template_code":"INTERMISSION","duration_min":15}'
+  -d '{"intent_type":"INTERMISSION","template_code":"INTERMISSION","duration_min":20}'
 
 # 직접 작성 (일반 안내)
 curl -X POST localhost:8000/api/notices -H 'Content-Type: application/json' \
   -d '{"intent_type":"INFO","pictogram_code":"info","text_ko":"좌석 안내","text_en":"Seat guide","text_zh":"座位指引","text_ja":"座席のご案内"}'
 ```
 
-**1건 유지 규칙 (🛠 OP-03, 제안)**
-- 송출 중인 공지가 있으면 `409 active_exists` → 프론트가 "현재 공지를 종료하고 새 공지를 송출할까요?" 팝업
-- 확인하면 `replace_active: true` 로 다시 요청 → 서버가 기존 공지 `ENDED` 후 새 공지 `CREATED`
-- 화재(비상)는 확인 없이 바로 대체 (❓ 협의)
+**1건 유지 규칙 + 화재 보호 (🛠 OP-03)**
+
+| 송출 중 | 새 공지 | 결과 |
+|---|---|---|
+| 없음 | 아무거나 | 바로 송출 |
+| 화재 아님 | 화재 아님 | `409 active_exists` → 프론트 확인 팝업 → `replace_active: true` 로 다시 요청하면 기존 공지 `ENDED` 후 새 공지 `CREATED` |
+| 화재 아님 | **화재** | 확인 없이 기존 공지 종료 후 화재 송출 |
+| **화재** | 화재 아님 | **`409 fire_active`, 밀어내기 불가.** 오퍼레이터가 화재를 [종료]한 뒤에만 송출 |
+| **화재** | 화재 | `409 fire_active`. 내용을 바꾸려면 정정(`PATCH`) |
+
+화재 대피 안내가 떠 있는데 "휴대폰 꺼주세요"가 확인 한 번으로 덮이는 일을 막기 위해서입니다.
 
 **AI 문구 API (🛠 OP-10, 제안)**
 ```http
@@ -226,7 +246,8 @@ POST /api/ai/translate
 
 AI 실패 시 → 503 {"detail": "ai_unavailable"}  (프론트는 직접 입력 칸을 그대로 둠)
 ```
-결과는 입력 칸을 채우는 용도이고, 오퍼레이터가 확인·수정한 뒤 송출합니다.
+- 결과는 입력 칸을 채우는 용도이고, 오퍼레이터가 확인·수정한 뒤 송출합니다.
+- 본문의 `{minutes}` 는 번역해도 **그대로 유지**합니다 (예: `"{minutes}分間の休憩です。"`).
 
 ### 6-2. 관객 (인증 없음)
 
@@ -281,18 +302,22 @@ es.addEventListener('notice_update', (e) => {
 
 **templates** (OP-08, OP-09)
 
-| 컬럼 | 설명 |
+11/17 팀원분 확정 필드 · 초기 데이터는 `data/templates.json`
+
+| 필드 | 설명 |
 |---|---|
-| `template_code` | PK. 예: `ETIQUETTE_PHOTO` |
-| `intent_type` | `FIRE` … `INFO` |
-| `pictogram_code` | 디자인팀 SVG 파일명 (❓ 확정 대기) |
-| `widget` | `none` / `timer` / `map` (AU-03) |
-| `default_minutes` | 타이머 기본값 (인터미션 15) |
-| `text_ko` | 한국어 쉬운 글 요약 문구 (예: "10분 대기 (무대 점검)") |
-| `text_en`, `text_zh`, `text_ja` | 번역 |
-| `is_default` | 기본 비상 템플릿 = 삭제 불가 |
-| `sort_order` | 추천·목록 순서 |
-| `created_at`, `updated_at` | |
+| `code` | PK, 영문 고유값 (예: `SHOW_DELAY`) |
+| `intent_type` | `FIRE` / `POWER_OUT` / `PAUSE` / `DELAY` / `INTERMISSION` / `ETIQUETTE` / `INFO` |
+| `title` | 목록에 보이는 이름 (예: "공연 지연 안내") |
+| `text_ko` | 한국어 쉬운 글 본문. 분 수 자리는 `{minutes}` |
+| `text_en`, `text_zh`, `text_ja` | 번역 (`{minutes}` 유지) |
+| `pictogram` | 아이콘 이름 (디자인팀 SVG 파일명, ❓ 확정 대기) |
+| `widget` | `none` / `timer` / `map` |
+| `needs_duration` | 분 수를 입력받을지 |
+| `default_minutes` | 기본 분 수 (없으면 `null`) |
+| `trigger_haptic` | 진동+점멸 (화재만 `true`) |
+| `is_default` | 기본 템플릿 (삭제·숨기기 불가) |
+| `sort_order` | 정렬 순서 (작을수록 위, 10 단위) |
 
 **notices** (OP-03, OP-04, AU-06)
 
@@ -300,9 +325,10 @@ es.addEventListener('notice_update', (e) => {
 |---|---|
 | `notice_id` | PK |
 | `status` | `ACTIVE` / `ENDED` |
-| `intent_type`, `template_code`, `pictogram_code`, `widget` | |
+| `intent_type`, `template_code`, `pictogram`, `widget` | |
 | `text_ko`, `text_en`, `text_zh`, `text_ja` | |
-| `expires_at` | 타이머 종료 시각 |
+| `duration_min` | 입력한 분 수 (`{minutes}` 치환에 사용) |
+| `expires_at` | 카운트다운 종료 시각 (`widget=timer` 일 때만) |
 | `trigger_haptic` | 화재만 true |
 | `revision` | 정정 횟수 |
 | `created_at`, `updated_at`, `ended_at` | |
@@ -324,8 +350,8 @@ es.addEventListener('notice_update', (e) => {
 | 구분 | 개발자 A: Core / 송출 | 개발자 B: AI 파이프라인 |
 |---|---|---|
 | 핵심 | 템플릿·공지·이력, 관객 송출, 서버 운영 | 음성 → 자막 → 추천, AI 문구 생성 |
-| 템플릿 | DB 테이블, CRUD API (OP-09), 초기 데이터 넣기 | `templates.json` 내용 (쉬운 글 문구, 픽토그램 키, 위젯) |
-| 공지 | 송출·정정·종료, 1건 유지 규칙, 템플릿 교체, 이력 (OP-03, 04) | - |
+| 템플릿 | DB 테이블, CRUD API (OP-09), `is_default` 삭제·숨기기 막기, 초기 데이터 넣기 | `templates.json` 내용 (확정 필드, 쉬운 글 문구, 4개 언어) |
+| 공지 | 송출·정정·종료, 1건 유지 규칙·화재 보호, `{minutes}` 치환, 템플릿 교체, 이력 (OP-03, 04) | - |
 | 관객 | SSE, `/active`, 지난 공지 (AU-01~07) | - |
 | 오퍼레이터 실시간 | - | WebSocket: 수음, 자막, 추천 (OP-01, 02, 06, 07) |
 | AI | - | CLOVA 스트리밍, GPT-4o-mini 분류, **쉬운 글 요약·번역 API** (OP-10) |
@@ -352,16 +378,16 @@ gantt
     axisFormat %m/%d
 
     section 개발자 A
-    DB 전환 (templates·notices·history)   :a1, 2026-11-17, 2d
-    템플릿 CRUD (OP-09)                   :a2, 2026-11-18, 2d
-    1건 유지·템플릿 교체·위젯·일본어 (OP-03,04)   :a3, 2026-11-19, 2d
+    DB 전환 (확정 필드)                    :a1, 2026-11-17, 2d
+    템플릿 CRUD·is_default (OP-09)        :a2, 2026-11-18, 2d
+    1건 유지·화재 보호·minutes·템플릿 교체  :a3, 2026-11-19, 2d
     지난 공지 API (AU-06)                 :a4, 2026-11-21, 1d
     AWS 개발 서버                         :a5, 2026-11-22, 1d
     연동 지원·부하 테스트                  :a6, 2026-11-23, 5d
 
     section 개발자 B
-    수정 패치 PR·GPT 평가                 :b1, 2026-11-17, 1d
-    추천 최대 3개·AI_FAILED·템플릿 정리     :b2, 2026-11-18, 1d
+    수정 패치 PR·GPT 평가·templates.json   :b1, 2026-11-17, 1d
+    추천 최대 3개·AI_FAILED                :b2, 2026-11-18, 1d
     쉬운 글 요약·번역 API (OP-10)          :b3, 2026-11-19, 2d
     CLOVA 실연결·음성 불분명 (OP-07)        :b4, 2026-11-20, 2d
     연동 지원·튜닝·지연 측정                :b5, 2026-11-22, 6d
@@ -379,7 +405,7 @@ gantt
 | 기간 | 개발자 A | 개발자 B | 끝낼 기준 |
 |---|---|---|---|
 | ~11/16 (완료) | 더미 서버, 로그인 제거 | 오퍼레이터 WS, CLOVA 클라이언트, GPT 분류, 추천 (PR #2) | ✅ |
-| 11/17~11/21 | DB 전환, 템플릿 CRUD, 1건 유지·템플릿 교체·위젯·`text_ja`, 지난 공지 | 수정 패치, GPT 평가, 추천 보완, 쉬운 글·번역 API, CLOVA 실연결 | **11/21** 수동 흐름(DB) + 음성 → 추천 + 쉬운 글·번역 API |
+| 11/17~11/21 | 템플릿 필드 확정(✅ 11/17), DB 전환, 템플릿 CRUD·`is_default`, 1건 유지·화재 보호, `{minutes}` 치환, 템플릿 교체, `text_ja`, 지난 공지 | 수정 패치, GPT 평가, `templates.json` 새 필드, 추천 최대 3개·AI_FAILED, 쉬운 글·번역 API, CLOVA 실연결 | **11/21** 수동 흐름(DB) + 음성 → 추천 + 쉬운 글·번역 API |
 | 11/22 | AWS 개발 서버 | 연동 문서 정리 | **프론트 연동 시작** |
 | 11/23~11/29 | 관객 화면·송출 연동, SSE 부하 테스트 | 오퍼레이터 화면 연동, 소음 테스트·프롬프트 튜닝, 지연 측정, 번역 검수 | **11/28** 프론트 포함 데모 |
 | 11/30~12/3 | 버그 수정, 문서 | 버그 수정, 문서 | **12/3** v0.1 |
@@ -394,21 +420,25 @@ gantt
 | 항목 | 결정 | 날짜 |
 |---|---|---|
 | 인증 | 없음 | 11/10 |
-| 진동·점멸 | 화재만 | 11/10 |
-| 일본어 | **포함.** 공지·템플릿·SSE·번역 API 모두 `text_ja` (없으면 `null`) | 11/17 |
+| 진동·점멸 | 화재만 (템플릿 `trigger_haptic`) | 11/10 |
+| 일본어 | **포함.** 공지·템플릿·SSE·번역 API 모두 `text_ja` | 11/17 |
 | 일반 안내 | **AI 가 분류하지 않음.** 6개 상황에 안 맞으면 추천 없음 → 오퍼레이터가 일반 안내로 직접 작성 | 11/17 |
-| 상황별 표 05 | 모든 상황에 쉬운 글 자막(AU-05). 위젯(AU-03)은 화재·인터미션만 | 11/17 |
+| 상황별 표 05 | 모든 상황에 쉬운 글 자막(AU-05). 위젯(AU-03)은 화재(약도)·인터미션(타이머)만 | 11/17 |
+| 템플릿 필드 | 7장 `templates` 표대로 확정 | 11/17 |
+| 분 수 vs 타이머 | `needs_duration`(분 수 입력: 중단·지연·인터미션) 과 `widget: timer`(카운트다운: 인터미션만) 분리. 본문은 `{minutes}` | 11/17 |
+| 추천 순서 | `sort_order` 순 앞의 3개 | 11/17 |
+| `is_default` | 화재·정전 기본 템플릿은 삭제·숨기기 불가 | 11/17 |
+| 화재 보호 | 화재 공지는 다른 공지로 밀어낼 수 없고 [종료]로만 내림 | 11/17 |
+| 화재 위젯 | 방향(`direction`) 대신 대피로 약도(`widget: map`) | 11/17 |
 
 ### 확인 필요
-| # | 항목 | 기능명세서 | 현재 서버 | 제안 |
-|---|---|---|---|---|
-| 1 | 화재 방향 | AU-03 은 **대피로 약도 이미지** | 화재 송출 시 `direction`(LEFT/RIGHT…) 필수 | `widget=map` 으로 바꾸고 `direction` 필수 해제 |
-| 2 | 지연·중단 타이머 | 타이머는 인터미션만 (OP-03, AU-03) | `SHOW_PAUSE`, `SHOW_DELAY` 도 시간 입력 필수 | 인터미션만 `timer`, 나머지 `none` |
-| 3 | 비상 공지 대체 | OP-03 "비상이면 확인 없이 대체 (협의)" | - | 화재는 확인 없이 대체 |
-| 4 | 픽토그램 키 | AU-02 매핑 | 디자인팀 확정 대기 | 확정되면 `templates.json` 만 수정 |
-| 5 | 무음 30초 안내 | OP-01 (협의) | - | 프론트가 입력 음량으로 판단 (서버는 30초 무음 시 CLOVA 연결만 정리) |
-| 6 | 중국어·일본어 검수 | - | `templates.json` 번역은 초안 | 검수 담당 정하기 |
-| 7 | 기능명세서 OP-02 문구 | 분류 목록에 "일반 안내" 포함 | AI 분류 대상 아님 | "6개 상황 분류, 해당 없으면 추천 없음"으로 수정 |
+| # | 항목 | 현재 | 제안 |
+|---|---|---|---|
+| 1 | 픽토그램 키 | 디자인팀 확정 대기 | 확정되면 `templates.json` 의 `pictogram` 만 수정 |
+| 2 | 무음 30초 안내 (OP-01 협의) | - | 프론트가 입력 음량으로 판단 (서버는 30초 무음 시 CLOVA 연결만 정리) |
+| 3 | 중국어·일본어 검수 | `templates.json` 번역은 초안 | 검수 담당 정하기 |
+| 4 | 기능명세서 OP-02 문구 | 분류 목록에 "일반 안내" 포함 | "6개 상황 분류, 해당 없으면 추천 없음"으로 수정 |
+| 5 | 템플릿 필드 이름 전환 | 지금 서버는 `template_code`·`pictogram_code`, 새 필드는 `code`·`pictogram` | A 의 DB 전환 PR 과 B 의 `templates.json` 을 **같이 머지** (따로 머지하면 더미 서버가 깨짐) |
 
 ---
 
